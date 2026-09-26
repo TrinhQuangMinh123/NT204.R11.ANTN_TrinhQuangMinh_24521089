@@ -11,4 +11,5 @@ __pycache__/
 
 # Docs
 CLAUDE.md
+docs/
 # Lưu ý: KHÔNG ignore *.log và *.pcap — đây là kết quả test cần commit trong TEST/
