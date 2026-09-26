@@ -1,0 +1,11 @@
+services:
+  # Chế độ --pcap (ADR-10): không mạng, không capability, chạy bằng UID của host
+  idps-offline:
+    build: .
+    image: idps            # service live (idps) sau này dùng chung image này
+    volumes:
+      - .:/app             # đọc PCAP và ghi output thẳng vào repo trên host
+    # Compose chỉ đọc biến môi trường; UID/GID của shell thường không được export
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    cap_drop: [ALL]
+    network_mode: none
