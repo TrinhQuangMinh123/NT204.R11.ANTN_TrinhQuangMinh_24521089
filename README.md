@@ -68,3 +68,5 @@ và cập nhật trong suốt quá trình làm bài.
 | Tệp | Mức độ hỗ trợ của AI |
 |-----|----------------------|
 | `README.md` | Soạn thảo nội dung tài liệu có giám sát|
+| `Dockerfile` | AI viết bản đầu và giải thích từng dòng (base image, cache layer, biến môi trường); tôi đọc hiểu, build và kiểm tra |
+| `requirements.txt` | AI tra phiên bản mới nhất và viết dòng pin; tôi kiểm tra phiên bản trong image khớp pin |

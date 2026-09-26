@@ -1,0 +1,3 @@
+# Scapy: chỉ dùng để lấy bytes thô + timestamp (C-12, ADR-2)
+scapy==2.7.0
+pytest==9.1.1
