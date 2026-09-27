@@ -3,6 +3,8 @@
 Nguồn giả và sink giả CHỈ nằm trong tests/ (NFR-9): thêm một module phía sau
 không được kéo theo thay đổi nào trong idps/capture/ hay idps/decode/.
 """
+import struct
+
 import pytest
 
 from idps.core.frame import RawFrame
@@ -13,6 +15,13 @@ from idps.decode.pipeline import process_frame
 
 DST = bytes.fromhex("02420a14000a")
 SRC = bytes.fromhex("02420a0a000a")
+
+# Packet Ethernet/IPv4/TCP hợp lệ — xem ghi chú cùng nội dung ở tests/test_cli.py.
+_TCP_SYN = struct.pack("!HHIIBBHHH", 54321, 80, 0x11223344, 0, 5 << 4, 0x02,
+                       64240, 0, 0)
+_IPV4 = struct.pack("!BBHHHBBH4s4s", (4 << 4) | 5, 0, 20 + len(_TCP_SYN),
+                    0x1234, 0x4000, 64, 6, 0,
+                    bytes((10, 10, 0, 10)), bytes((10, 20, 0, 10)))
 
 
 def frame(data=b"", linktype=1):
@@ -163,7 +172,7 @@ def test_every_sink_is_closed_exactly_once():
 
 def test_runner_with_the_real_pipeline():
     """decode được tiêm vào: main.py nối process_frame vào đúng chỗ này."""
-    good = frame(DST + SRC + b"\x08\x00" + b"\x45\x00")
+    good = frame(DST + SRC + b"\x08\x00" + _IPV4 + _TCP_SYN)
     arp = frame(DST + SRC + b"\x08\x06" + b"arp")
     short = frame(b"\x00" * 3)
     sink = FakeSink()

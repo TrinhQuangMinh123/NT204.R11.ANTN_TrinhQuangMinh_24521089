@@ -19,8 +19,17 @@ ROOT = Path(__file__).resolve().parent.parent
 MAIN = ROOT / "main.py"
 
 ETH = bytes.fromhex("02420a14000a" "02420a0a000a" "0800")
-IPV4_STUB = ETH + b"\x45\x00nothing-below-yet"
 ARP = bytes.fromhex("02420a14000a" "02420a0a000a" "0806") + b"arp"
+
+# Packet Ethernet/IPv4/TCP hợp lệ (status "ok"). Trước T5.4 đây chỉ là
+# b"\x45\x00..." vì chưa có parser IPv4; từ khi pipeline có tầng network thì
+# hai byte đó là một header IPv4 CỤT, nên các ca đếm status phải dùng packet thật.
+_TCP_SYN = struct.pack("!HHIIBBHHH", 54321, 80, 0x11223344, 0, 5 << 4, 0x02,
+                       64240, 0, 0)
+_IPV4 = struct.pack("!BBHHHBBH4s4s", (4 << 4) | 5, 0, 20 + len(_TCP_SYN),
+                    0x1234, 0x4000, 64, 6, 0,
+                    bytes((10, 10, 0, 10)), bytes((10, 20, 0, 10)))
+IPV4_STUB = ETH + _IPV4 + _TCP_SYN
 
 
 def write_pcap(path, frames, last_incl_len=None):
