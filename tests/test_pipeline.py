@@ -594,7 +594,7 @@ def test_ancount_larger_than_actual_keeps_the_parsed_answer():
     struct.pack("!H", 0xC000 | 9999),                    # ra ngoài payload
 ])
 def test_bad_pointer_in_the_question_is_unknown_not_malformed(bad_name):
-    """Ranh giới cần biết: con trỏ xấu trong QUESTION -> UNKNOWN, không malformed.
+    """Ranh giới ĐÃ CHỐT: con trỏ xấu trong QUESTION -> UNKNOWN, không malformed.
 
     Chữ ký DNS của Phụ lục C là "toàn bộ phần question parse được". Nếu chính
     phần question hỏng thì `matches_dns()` trả False -> detector không gán DNS,
@@ -603,8 +603,21 @@ def test_bad_pointer_in_the_question_is_unknown_not_malformed(bad_name):
 
     Nói cách khác, REQ-8.4 ("đánh dấu malformed") chỉ có hiệu lực khi message đã
     được NHẬN DIỆN là DNS — tức con trỏ xấu nằm ở answer hoặc trong RDATA của
-    CNAME/NS/PTR (hai test ngay trên). Phần quan trọng nhất của REQ-8.4 vẫn đúng
-    ở cả hai ca: parser dừng ngay, không treo, và không có lỗi `internal`.
+    CNAME/NS/PTR (hai test ngay trên).
+
+    Quyết định (2026-09-27, design.md ADR-5 mục "Ranh giới đã chốt"): giữ
+    `UNKNOWN`, KHÔNG sửa thành `malformed`, vì đổi nhãn không giải quyết bài toán
+    nào:
+      * `status` là nhãn phân loại; tính chất an toàn của REQ-8.4 (dừng ngay,
+        không treo, không lỗi `internal`) đã đúng ở ca này — con trỏ vòng lặp bị
+        phát hiện ngay trong `question_section_fits()`, là điều test này khẳng
+        định bằng việc event tồn tại và `errors` rỗng.
+      * Event không mất bằng chứng: `udp.payload_b64` giữ đủ bytes (I-4), và
+        `app_proto="UNKNOWN"` trên port 53 tự nó là tín hiệu đáng viết luật.
+      * `malformed` nghĩa là "một parser thấy mâu thuẫn trong dữ liệu thuộc tầng
+        của nó"; ở đây không parser nào nhận payload này.
+      * Giá phải trả để đổi nhãn: nới chữ ký thành "header + QDCOUNT >= 1" ->
+        gần như mọi payload UDP >= 12 byte bị gán DNS (rủi ro R5).
     """
     payload = dns_header() + bad_name + struct.pack("!HH", 1, 1)
     event = process_frame(frame_udp(dst_port=53, payload=payload), 1)
