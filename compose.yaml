@@ -52,6 +52,25 @@ services:
     # phải trỏ qua sensor. exec để sleep thành PID 1 → nhận được SIGTERM khi down.
     command: ["sh", "-c", "ip route add 10.20.0.0/24 via 10.10.0.254 && ip route del default && exec sleep infinity"]
 
+  # Victim (ADR-13, ADR-15): chạy các dịch vụ mà attacker gửi traffic tới
+  victim:
+    build: ./lab/victim
+    image: idps-victim
+    # Danh sách này tìm bằng cách bỏ hết rồi đọc log nginx, thêm từng vé đang thiếu:
+    # NET_ADMIN         tự thêm route về mạng attacker
+    # NET_BIND_SERVICE  bind port 80 (< 1024)
+    # CHOWN             nginx master đổi chủ thư mục tạm sang www-data
+    # SETUID/SETGID     nginx master hạ quyền worker xuống www-data
+    # Không cần NET_RAW: victim không bắt gói.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_BIND_SERVICE, CHOWN, SETUID, SETGID]
+    networks:
+      net_int:
+        ipv4_address: 10.20.0.10
+    depends_on: [idps]
+    # nginx chạy foreground để làm PID 1 → nhận SIGTERM khi compose down
+    command: ["sh", "-c", "ip route add 10.10.0.0/24 via 10.20.0.254 && ip route del default && exec nginx -g 'daemon off;'"]
+
 # Đường duy nhất giữa hai mạng là xuyên qua idps (REQ-19.5). Tính chất đó KHÔNG
 # dựa vào internal: true (luật DOCKER-INTERNAL của Docker chặn luôn cả đường qua
 # sensor) mà dựa vào việc attacker/victim chỉ có một route tới mạng kia, trỏ vào
