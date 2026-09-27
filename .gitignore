@@ -12,4 +12,5 @@ __pycache__/
 # Docs
 CLAUDE.md
 docs/
+Bai-tap-01_Packet_Capture_Parser_IDS.pdf
 # Lưu ý: KHÔNG ignore *.log và *.pcap — đây là kết quả test cần commit trong TEST/

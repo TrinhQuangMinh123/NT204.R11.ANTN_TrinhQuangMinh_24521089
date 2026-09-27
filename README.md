@@ -61,7 +61,7 @@ Công cụ: **Claude Opus 5**. Mục đích sử dụng:
 - **Giải thích kiến thức nền** — cấu trúc header, TCP handshake, hành vi của các kiểu quét cổng, để
   hiểu *tại sao* code cần viết như vậy.
 
-**Cam kết:** AI chỉ đóng vai trò hỗ trợ tài liệu, định hướng và giải thích. Tôi tự viết, tự đọc hiểu và
+**Cam kết:** AI đóng vai trò viết code, hỗ trợ tài liệu, và giải thích. Tôi tự viết lại mỗi file quan trọng, tự đọc hiểu và
 có thể giải thích từng dòng mã nguồn trong repo này. Các tệp có sử dụng AI hỗ trợ được liệt kê bên dưới
 và cập nhật trong suốt quá trình làm bài.
 
