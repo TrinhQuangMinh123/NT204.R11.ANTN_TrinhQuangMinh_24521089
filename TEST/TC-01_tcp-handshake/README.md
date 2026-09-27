@@ -89,9 +89,22 @@ b'GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nUser-Agent: curl/8.14.1\r\nA...'   (74 b
 
 ## 6. Ghi chú
 
-- `app_proto` còn `null` ở mọi dòng: detector và parser HTTP là việc của Phase 6 (T6.2, T6.4). Sau
-  T6.4, chạy lại chính file này phải cho packet 4 và 6 có `app_proto="HTTP"` (V6.3 yêu cầu phần
-  `output.jsonl` của các tầng dưới **không đổi**).
+- **Cập nhật 2026-09-27 (sau T6.4):** `output.jsonl` và `run.log` đã được ghi lại từ **chính
+  `input.pcap` đã commit**, bằng đúng lệnh ở §2 — nên test case vẫn tái lập được. So với bản ghi ở
+  Phase 5: 8/10 dòng **giống hệt từng byte**; packet 4 và 6 chỉ đổi ở ba khoá tầng ứng dụng
+  (`app_proto`, `detect_method`, `app`) từ `null` sang giá trị thật:
+
+  | # | `app_proto` | `detect_method` | `app` |
+  |---|---|---|---|
+  | 4 | `"HTTP"` | `"port+payload"` | `kind=request`, `method=GET`, `uri=/`, 3 header, `body_len=0` |
+  | 6 | `"HTTP"` | `"port+payload"` | `kind=response`, `status_code=200`, `reason=OK`, 8 header, `body_len=11` |
+
+  Đây là nội dung thật của V6.3: `diff` với bản cũ **không** rỗng (vì Phase 6 thêm một tầng cho đúng
+  hai packet có payload), nhưng mọi khoá của tầng liên kết / network / transport **không đổi một
+  byte** — tức Phase 6 không làm hồi quy Phase 5. Bằng chứng cũ được thay bằng một **commit mới**,
+  không sửa lịch sử git.
+- `detect_method` là `"port+payload"` ở cả hai dòng vì traffic này chạy trên port 80. Ca
+  `"payload"` (port 8081) nằm ở TC-13 — Phase 7.
 - `ipv4.ihl` = 5 ở mọi packet (không có IP options), nên ca IHL > 5 chỉ kiểm được bằng packet dựng
   tay trong `tests/test_ipv4.py`.
 - `ethernet.src_mac` / `dst_mac` là MAC của attacker và của **sensor** (không phải của victim): trên
