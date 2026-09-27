@@ -1,0 +1,98 @@
+# TC-01 — TCP handshake
+
+| Mục | Giá trị |
+|---|---|
+| Yêu cầu kiểm chứng | REQ-5.2 (cờ TCP thành danh sách tên), REQ-5.1, REQ-5.3, REQ-4.1 |
+| Task | T5.5 · Phase 5 |
+| Ngày ghi | 2026-09-27 |
+| Traffic | một lần `curl http://10.20.0.10/` từ `attacker` sang `victim`, đi xuyên sensor |
+| Kết quả | 10 packet, `processed=10 unknown=0 malformed=0` |
+| `md5sum input.pcap` | `a138617f9e32ce108985dce6e67a19b6` |
+
+## 1. Mục tiêu
+
+Chứng minh **ba packet của một handshake phân biệt được CHỈ bằng trường `flags`** trong event
+(REQ-5.2), trên traffic thật chứ không phải packet dựng tay như `tests/test_tcp.py`.
+
+## 2. Cách ghi lại
+
+Bắt gói trên `attacker` (interface `eth0`), ghi ra **stdout**, shell của host hứng lại — nhờ vậy file
+thuộc về user host và container không cần quyền ghi vào repo (ADR-16):
+
+```sh
+docker compose exec -T attacker timeout 12 tcpdump -i eth0 -U -w - \
+    'tcp and host 10.20.0.10 and port 80' > TEST/TC-01_tcp-handshake/input.pcap &
+sleep 4
+docker compose exec -T attacker curl -s -o /dev/null http://10.20.0.10/
+```
+
+**Vì sao filter là `tcp and host 10.20.0.10 and port 80`:** nó loại ARP và mọi traffic khác, nên
+packet đầu tiên trong file chắc chắn là packet đầu tiên của kết nối. Một kết nối TCP chỉ có **một**
+cách mở (RFC 9293), nên ba packet đầu **bắt buộc** là SYN → SYN/ACK → ACK; không cần lọc theo cờ.
+
+`-U` (ghi từng packet, không đệm) để file vẫn hợp lệ khi `timeout` gửi SIGTERM cho `tcpdump`.
+
+Chạy parser:
+
+```sh
+docker compose run --rm idps-offline python main.py \
+    --pcap TEST/TC-01_tcp-handshake/input.pcap \
+    -o TEST/TC-01_tcp-handshake/output.jsonl 2>&1 | tee TEST/TC-01_tcp-handshake/run.log
+```
+
+`run.log` chỉ giữ output của **chương trình**; các dòng `Container … Creating` của Docker Compose đã
+bị lọc bỏ vì chúng chứa id container sinh ngẫu nhiên mỗi lần chạy, sẽ làm bằng chứng không lặp lại được.
+
+## 3. Điều kiện dừng
+
+```sh
+$ grep -o '"flags":\[[^]]*\]' TEST/TC-01_tcp-handshake/output.jsonl | head -3
+"flags":["SYN"]
+"flags":["SYN","ACK"]
+"flags":["ACK"]
+```
+
+Ba giá trị khác nhau đôi một → REQ-5.2 đạt.
+
+## 4. Toàn bộ 10 packet
+
+| # | Chiều | `flags` | `data_offset` | `payload_len` | Ý nghĩa |
+|---|---|---|---|---|---|
+| 1 | attacker → victim | `["SYN"]` | 10 | 0 | xin mở kết nối |
+| 2 | victim → attacker | `["SYN","ACK"]` | 10 | 0 | đồng ý + xác nhận SYN |
+| 3 | attacker → victim | `["ACK"]` | 8 | 0 | xác nhận → kết nối mở |
+| 4 | attacker → victim | `["PSH","ACK"]` | 8 | 74 | `GET / HTTP/1.1` |
+| 5 | victim → attacker | `["ACK"]` | 8 | 0 | xác nhận đã nhận request |
+| 6 | victim → attacker | `["PSH","ACK"]` | 8 | 239 | `HTTP/1.1 200 OK` |
+| 7 | attacker → victim | `["ACK"]` | 8 | 0 | xác nhận đã nhận response |
+| 8 | attacker → victim | `["FIN","ACK"]` | 8 | 0 | attacker hết dữ liệu |
+| 9 | victim → attacker | `["FIN","ACK"]` | 8 | 0 | victim cũng hết dữ liệu |
+| 10 | attacker → victim | `["ACK"]` | 8 | 0 | đóng xong (4 bước) |
+
+## 5. Vì sao test case này còn kiểm được REQ-5.3
+
+Cột `data_offset` **không có giá trị 5 nào cả**: mọi segment đều có TCP options.
+
+- Packet 1–2: `data_offset=10` → header **40 byte** (20 byte options: MSS, SACK permitted,
+  timestamp, window scale).
+- Packet 3–10: `data_offset=8` → header **32 byte** (12 byte options: timestamp + 2 nop).
+
+Nếu parser giả định header TCP dài 20 byte thì payload của packet 4 sẽ bắt đầu sớm **12 byte**, và
+thay vì `GET / HTTP/1.1` sẽ đọc ra 12 byte options rồi mới tới `GET`. Sai này **im lặng** — vẫn ra
+bytes, không có lỗi nào báo — nên nó chỉ lộ ra ở đúng loại bằng chứng này.
+
+Kiểm lại I-4 (base64 giải mã ngược ra đúng bytes gốc) trên packet 4:
+
+```
+b'GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nUser-Agent: curl/8.14.1\r\nA...'   (74 byte)
+```
+
+## 6. Ghi chú
+
+- `app_proto` còn `null` ở mọi dòng: detector và parser HTTP là việc của Phase 6 (T6.2, T6.4). Sau
+  T6.4, chạy lại chính file này phải cho packet 4 và 6 có `app_proto="HTTP"` (V6.3 yêu cầu phần
+  `output.jsonl` của các tầng dưới **không đổi**).
+- `ipv4.ihl` = 5 ở mọi packet (không có IP options), nên ca IHL > 5 chỉ kiểm được bằng packet dựng
+  tay trong `tests/test_ipv4.py`.
+- `ethernet.src_mac` / `dst_mac` là MAC của attacker và của **sensor** (không phải của victim): trên
+  chặng `attacker → sensor`, victim nằm sau một router nên MAC đích là MAC của cổng `ext0` của sensor.
