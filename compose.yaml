@@ -33,6 +33,25 @@ services:
     # Phase 1 chưa chạy capture; giữ container sống để Phase 4 exec vào
     command: ["sleep", "infinity"]
 
+  # Attacker (ADR-13): bài 1 sinh traffic thường, bài sau sinh traffic tấn công
+  attacker:
+    build: ./lab/attacker
+    image: idps-attacker
+    # NET_ADMIN: tự thêm route · NET_RAW: ping, tcpdump mở interface
+    # SETUID/SETGID: chỉ để tcpdump của Debian tự HẠ quyền xuống user tcpdump —
+    # nó là thứ đọc dữ liệu do attacker tạo ra, càng ít quyền càng tốt.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID]
+    # Không bind mount TEST/: PCAP ghi ra stdout rồi shell của host hứng lại, nhờ
+    # vậy file thuộc về user host mà container không cần quyền ghi vào repo.
+    networks:
+      net_ext:
+        ipv4_address: 10.10.0.10
+    depends_on: [idps]
+    # Docker chỉ cắm sẵn route trong net_ext; đường sang net_int phải tự khai và
+    # phải trỏ qua sensor. exec để sleep thành PID 1 → nhận được SIGTERM khi down.
+    command: ["sh", "-c", "ip route add 10.20.0.0/24 via 10.10.0.254 && ip route del default && exec sleep infinity"]
+
 # Đường duy nhất giữa hai mạng là xuyên qua idps (REQ-19.5). Tính chất đó KHÔNG
 # dựa vào internal: true (luật DOCKER-INTERNAL của Docker chặn luôn cả đường qua
 # sensor) mà dựa vào việc attacker/victim chỉ có một route tới mạng kia, trỏ vào

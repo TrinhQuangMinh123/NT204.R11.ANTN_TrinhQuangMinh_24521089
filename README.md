@@ -72,3 +72,4 @@ và cập nhật trong suốt quá trình làm bài.
 | `requirements.txt` | AI tra phiên bản mới nhất và viết dòng pin; tôi kiểm tra phiên bản trong image khớp pin |
 | `tests/test_layering.py` | AI viết bản đầu và giải thích cách dùng `ast` quét import (kể cả import tương đối); tôi đọc hiểu, chạy và thử chèn `import scapy` để thấy test fail |
 | `compose.yaml` | AI viết bản đầu và giải thích bind mount, `user` theo UID host, `cap_drop`, `network_mode: none`; tôi đọc hiểu và chạy lại các lệnh kiểm tra (UID, CapEff, chủ sở hữu file). AI viết tiếp service `idps` (gateway) và hai mạng lab, giải thích vì sao sensor phải chạy root mới dùng được `NET_RAW`; tôi đọc hiểu và tự kiểm tra `ext0`/`int0`, `ip_forward`, địa chỉ IP |
+| `lab/attacker/Dockerfile` | AI chọn base image cùng họ Debian với sensor và viết danh sách gói kèm lý do từng gói, giải thích `--no-install-recommends`; tôi đọc hiểu, build và tự kiểm tra route, ping |
