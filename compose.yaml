@@ -9,3 +9,55 @@ services:
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     cap_drop: [ALL]
     network_mode: none
+
+  # Sensor (ADR-13): nằm giữa hai mạng, kernel chuyển tiếp gói, Python chỉ nghe
+  idps:
+    build: .
+    image: idps
+    volumes:
+      - .:/app
+    # Bắt gói = mở AF_PACKET → cần CAP_NET_RAW. Capability chỉ hiệu lực với uid 0,
+    # nên service này chạy root (khác idps-offline) nhưng bỏ 13/14 quyền còn lại.
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]
+    # Chuyển tiếp do kernel làm, dockerd bật giúp lúc tạo container (REQ-19.4)
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      net_ext:
+        ipv4_address: 10.10.0.254
+        interface_name: ext0
+      net_int:
+        ipv4_address: 10.20.0.254
+        interface_name: int0
+    # Phase 1 chưa chạy capture; giữ container sống để Phase 4 exec vào
+    command: ["sleep", "infinity"]
+
+# Đường duy nhất giữa hai mạng là xuyên qua idps (REQ-19.5). Tính chất đó KHÔNG
+# dựa vào internal: true (luật DOCKER-INTERNAL của Docker chặn luôn cả đường qua
+# sensor) mà dựa vào việc attacker/victim chỉ có một route tới mạng kia, trỏ vào
+# sensor, và default route bị xoá nên không còn lối ra host. Kiểm chứng: tắt idps
+# thì curl thất bại. .1 của mỗi subnet Docker giữ, .254 là sensor.
+networks:
+  net_ext:
+    driver_opts:
+      # Docker 28+ mặc định thêm luật raw/PREROUTING
+      #   -d <IP container> ! -i <bridge cua no> -j DROP
+      # chặn đúng việc sensor chuyển tiếp gói giữa hai mạng. nat-unprotected bỏ
+      # lớp đó. Không dùng internal: true vì nó thêm luật DOCKER-INTERNAL
+      # "-i br_ext ! -d 10.10.0.0/24 -j DROP" — chặn nốt đường qua sensor.
+      com.docker.network.bridge.gateway_mode_ipv4: nat-unprotected
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+  net_int:
+    driver_opts:
+      # Docker 28+ mặc định thêm luật raw/PREROUTING
+      #   -d <IP container> ! -i <bridge cua no> -j DROP
+      # chặn đúng việc sensor chuyển tiếp gói giữa hai mạng. nat-unprotected bỏ
+      # lớp đó. Không dùng internal: true vì nó thêm luật DOCKER-INTERNAL
+      # "-i br_ext ! -d 10.10.0.0/24 -j DROP" — chặn nốt đường qua sensor.
+      com.docker.network.bridge.gateway_mode_ipv4: nat-unprotected
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
