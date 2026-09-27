@@ -7,26 +7,28 @@
 | Ngày ghi | 2026-09-27 |
 | Traffic | một `curl http://10.20.0.10/` từ `attacker`, **kèm một header 2000 byte** để segment dữ liệu lớn hẳn lên |
 | Kết quả | 10 packet, `processed=10 unknown=0 malformed=0` |
-| `md5sum input.pcap` | `3773733ece0980e4f93e6b71439a5e1b` |
+| `md5sum input.pcap` | `bb4235637ef3f9a6e62b6d6aa39e287e` |
 
 ## 1. Kịch bản
 
 TC-01 đã chứng minh phần **cờ** của header TCP. TC-02 chứng minh phần còn lại: **payload**.
 
 Traffic cố tình khác TC-01 ở một điểm — request mang thêm header `X-Filler` dài 2000 byte, nên
-segment dữ liệu dài `2086` byte thay vì `74` byte. Chọn như vậy vì một payload lớn làm ba con số
-độc lập nhau (`ipv4.total_length`, `tcp.data_offset`, `tcp.payload_len`) phải khớp nhau bằng phép
+segment dữ liệu dài `2086` byte thay vì `74` byte. Chọn như vậy vì payload lớn buộc ba con số độc
+lập nhau (`ipv4.total_length`, `tcp.data_offset`, `tcp.payload_len`) phải khớp nhau bằng một phép
 tính, chứ không "tình cờ đúng" như khi payload chỉ có vài chục byte.
 
 ## 2. Lệnh tái hiện
 
 ```sh
 TC=TEST/TC-02_tcp-data
-docker compose exec -T attacker timeout 12 tcpdump -i eth0 -U -w - \
+docker compose exec -T attacker tcpdump -i eth0 -U -c 10 -w - \
     'tcp and host 10.20.0.10 and port 80' > $TC/input.pcap &
-sleep 4
+CAP=$!
+sleep 3
 docker compose exec -T attacker sh -c \
     'F=$(printf "A%.0s" $(seq 1 2000)); curl -s -o /dev/null -H "X-Filler: $F" http://10.20.0.10/'
+wait $CAP
 ```
 
 ```sh
@@ -34,10 +36,21 @@ docker compose run --rm idps-offline python main.py \
     --pcap $TC/input.pcap -o $TC/output.jsonl 2>&1 | tee $TC/run.log
 ```
 
-`printf "A%.0s" $(seq 1 2000)` sinh đúng 2000 chữ `A` — filler **tất định**, nên chạy lại lệnh này
-cho ra một request giống hệt (chỉ khác port nguồn và timestamp do kernel chọn).
+Ba chi tiết của lệnh bắt gói, mỗi cái sửa một cách hỏng cụ thể:
 
-`-U` để `tcpdump` ghi từng packet, không đệm → file vẫn hợp lệ khi `timeout` gửi SIGTERM.
+- **`-c 10`** — tcpdump tự thoát sau packet thứ 10, nên `wait $CAP` trả về ngay và **không để lại
+  tiến trình bắt gói nào**. Không dùng `timeout 12` trong container: trên máy WSL2 này `timeout` đã
+  **không** bắn SIGALRM (`/proc/<pid>/timers` còn treo `signal: 14` sau hơn một giờ — WSL2 làm mất
+  timer CLOCK_REALTIME khi máy sleep/resume). Một tcpdump sống sót như vậy vẫn giữ **fd ghi** vào
+  file bằng chứng của test case cũ và âm thầm ghi traffic mới vào đó. Số 10 lấy từ chính kịch bản:
+  3 handshake + 2 data + 2 ack + 3 đóng kết nối (bảng §5).
+- **`-U`** — ghi từng packet, không đệm; file hợp lệ ngay cả khi phải dừng tcpdump giữa phiên.
+- **`> $TC/input.pcap` ở shell của host** — file do host tạo nên thuộc user host; container không cần
+  quyền ghi vào repo (ADR-16).
+
+`printf "A%.0s" $(seq 1 2000)` sinh đúng 2000 chữ `A` — filler **tất định**, nên chạy lại cho ra một
+request giống hệt (chỉ khác port nguồn, sequence number và timestamp do kernel chọn).
+
 `run.log` chỉ giữ output của **chương trình**; dòng `Container … Creating` của Compose bị lọc bỏ vì
 chứa id sinh ngẫu nhiên, sẽ làm bằng chứng không lặp lại được.
 
@@ -93,8 +106,8 @@ bytes, không lỗi nào báo — nên nó chỉ lộ ra ở phép tính trên.
 `seq` của TCP đếm theo byte, nên bên nhận phải `ack` đúng `seq + payload_len`:
 
 ```
-packet 4: seq=2847186603 + 2086 = 2847188689 = ack của packet 5   ✓
-packet 6: seq= 623595339 +  239 =  623595578 = ack của packet 7   ✓
+packet 4: seq=2875982552 + 2086 = 2875984638 = ack của packet 5   ✓
+packet 6: seq= 907853030 +  239 =  907853269 = ack của packet 7   ✓
 ```
 
 Đây là bằng chứng do **victim và kernel** tạo ra, không phải do parser tự nói về mình.
@@ -106,7 +119,7 @@ packet 6: seq= 623595339 +  239 =  623595578 = ack của packet 7   ✓
 >>> len(d)
 2086
 >>> d[:58]
-b'GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nUser-Agent: curl/8.14.1'
+b'GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nUser-Agent: curl/8.14.1\r'
 >>> d.count(b"A"), d.endswith(b"\r\n\r\n")
 (2002, True)
 ```
@@ -119,15 +132,15 @@ b'GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nUser-Agent: curl/8.14.1'
 - **`total_length` = 2138 > MTU 1500 mà packet vẫn đi được.** Đây không phải lỗi: `tcpdump` chạy
   trên **chính máy gửi**, ở điểm nằm **trước** khi kernel chia buffer thành các segment vừa MTU
   (TCP segmentation offload / GSO). Cùng họ với lý do `idps/decode/ipv4.py` **không** kiểm header
-  checksum — packet bắt trên máy gửi có checksum chưa được NIC điền (rủi ro R1 trong design §11.1).
+  checksum — packet bắt trên máy gửi có checksum chưa được NIC điền (rủi ro R1, design §11.1).
   Muốn thấy request bị chia thành hai segment thật thì phải bắt trên `int0` của sensor (phía sau
   điểm segment hoá), không phải trên `eth0` của attacker.
 - Parser HTTP đọc trọn request trong **một** packet nên `incomplete=false`. Ca `incomplete=true`
-  (request nằm vắt qua hai segment) không dựng được bằng lab ở điểm bắt này, nên nó được kiểm bằng
+  (request vắt qua hai segment) không dựng được bằng lab ở điểm bắt này, nên nó được kiểm bằng
   packet dựng tay trong `tests/test_http.py` (ba mức chưa hoàn chỉnh).
 - 8/10 packet có `payload_len=0`: đó là các packet **chỉ có ý nghĩa điều khiển** (handshake, ack,
   đóng kết nối). Chúng vẫn là event đầy đủ khoá — `app_proto` là `null` chứ không phải `"UNKNOWN"`,
   vì "không có dữ liệu" khác "có dữ liệu mà không nhận ra" (REQ-15.4).
-- Port nguồn (`35680` ở lần ghi này) do kernel của attacker chọn nên **mỗi lần bắt lại sẽ khác**;
-  `input.pcap` đã commit là bằng chứng cố định, `output.jsonl` sinh lại từ chính nó thì giống hệt
-  từng byte (V7.1).
+- Port nguồn (`57410` ở lần ghi này) và sequence number do kernel của attacker chọn nên **mỗi lần
+  bắt lại sẽ khác**; `input.pcap` đã commit là bằng chứng cố định, `output.jsonl` sinh lại từ chính
+  nó thì giống hệt từng byte (V7.1).
