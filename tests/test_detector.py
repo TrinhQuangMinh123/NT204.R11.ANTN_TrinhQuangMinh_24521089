@@ -6,9 +6,10 @@ import pytest
 
 from idps.decode.detector import (APP_PROTOCOLS, HTTP_METHODS, AppProto,
                                   Detection, app_proto_by_name, detect,
-                                  matches_dns, matches_http)
+                                  matches_dns, matches_http, matches_smtp)
 from idps.decode.dns import parse_dns
 from idps.decode.http import parse_http
+from idps.decode.smtp import parse_smtp
 
 GET = b"GET / HTTP/1.1\r\nHost: 10.20.0.10\r\n\r\n"
 RESPONSE = b"HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\nhi"
@@ -159,9 +160,14 @@ def test_registry_lookup_by_name():
 
 
 def test_registry_lookup_of_unknown_name():
-    """"UNKNOWN" và None không phải tên giao thức -> không có dòng registry."""
+    """"UNKNOWN" không phải tên giao thức -> không có dòng registry.
+
+    "FTP" đứng đây thay cho "SMTP" của bản trước: từ T9.2 SMTP đã là một dòng
+    thật, nên ca "tên chưa có trong registry" cần một giao thức ngoài phạm vi
+    bài (REQ, §3 phạm vi: chỉ HTTP/DNS/SMTP).
+    """
     assert app_proto_by_name("UNKNOWN") is None
-    assert app_proto_by_name("SMTP") is None      # Phase 9 mới thêm
+    assert app_proto_by_name("FTP") is None
 
 
 def test_registry_entries_are_well_formed():
@@ -278,3 +284,105 @@ def test_adding_dns_did_not_change_http_detection():
     assert http() == Detection("HTTP", "port+payload")
     assert http(dport=8081) == Detection("HTTP", "payload")
     assert http(payload=b"\x16\x03\x01\x00\x95") == Detection("UNKNOWN", None)
+
+
+# --- T9.2: SMTP (REQ-10.2, 11.3, Phụ lục C, NFR-6) --------------------------
+
+EHLO = b"EHLO attacker.lab\r\n"
+# Banner aiosmtpd gửi ra ngay khi TCP bắt tay xong (xem TEST/TC-10).
+BANNER = b"220 victim.lab Python SMTP 1.4.6\r\n"
+SMTP_PORT = 25
+SUBMISSION_PORT = 2525       # port lạ nhưng payload vẫn là SMTP (REQ-11.3)
+
+
+def smtp(sport=40470, dport=SMTP_PORT, payload=EHLO, transport="TCP"):
+    return detect(transport, sport, dport, payload)
+
+
+def test_ehlo_on_port_25():
+    assert smtp() == Detection("SMTP", "port+payload")
+
+
+def test_banner_direction_also_matches_the_port():
+    """sport=25: reply đi từ server về — chữ ký khác chiều đi, port thì không."""
+    assert smtp(sport=SMTP_PORT, dport=40470, payload=BANNER) == Detection(
+        "SMTP", "port+payload")
+
+
+def test_smtp_on_nonstandard_port():
+    """REQ-11.3: reply trên port 2525 -> nhận nhờ payload, không nhờ port."""
+    assert smtp(sport=SUBMISSION_PORT, dport=40470,
+                payload=BANNER) == Detection("SMTP", "payload")
+    assert smtp(dport=SUBMISSION_PORT, payload=EHLO) == Detection("SMTP",
+                                                                  "payload")
+
+
+def test_arbitrary_text_on_port_25_is_unknown():
+    """REQ-10.2: port khớp mà payload không khớp thì KHÔNG gán."""
+    assert smtp(payload=b"hello world\r\n") == Detection("UNKNOWN", None)
+
+
+def test_ehlox_on_port_25_is_unknown():
+    """Chữ ký đòi dấu phân cách sau tên lệnh, đúng như "GET " của HTTP."""
+    assert smtp(payload=b"EHLOX attacker.lab\r\n") == Detection("UNKNOWN", None)
+
+
+@pytest.mark.parametrize("payload", [b"", b"2", b"25", b"250", b"E", b"EHL"])
+def test_short_payload_on_port_25_never_raises(payload):
+    """"250" thiếu dấu phân cách -> chưa đủ căn cứ, không đoán (I-5)."""
+    assert smtp(payload=payload).app_proto in (None, "UNKNOWN")
+
+
+def test_smtp_signature_is_not_applied_to_udp():
+    assert smtp(transport="UDP", payload=EHLO) == Detection("UNKNOWN", None)
+
+
+def test_matches_smtp_directly():
+    assert matches_smtp(EHLO) is True
+    assert matches_smtp(BANNER) is True
+    assert matches_smtp(b"250-victim.lab\r\n") is True
+    assert matches_smtp(b"mail from:<a@b>\r\n") is True
+    assert matches_smtp(b"") is False
+    assert matches_smtp(GET) is False
+
+
+def test_smtp_registry_entry_points_at_the_smtp_parser():
+    """NFR-6: pipeline lấy parser QUA registry — không có bảng thứ hai."""
+    proto = app_proto_by_name("SMTP")
+    assert proto.parse is parse_smtp
+    assert proto.transport == "TCP" and proto.ports == (SMTP_PORT,)
+    assert proto.parse(EHLO).fields["command"] == "EHLO"
+
+
+def test_http_and_smtp_signatures_do_not_overlap():
+    """Hai dòng TCP nằm cạnh nhau: không payload nào khớp cả hai, nên thứ tự
+    thử trong registry không đổi được kết quả của bất kỳ ca nào."""
+    for payload in (GET, RESPONSE, EHLO, BANNER, b"DATA\r\n",
+                    b"HTTP/1.1 404 Not Found\r\n"):
+        assert not (matches_http(payload) and matches_smtp(payload))
+
+
+def test_smtp_signature_does_not_steal_http_traffic_on_port_80():
+    """Mấu chốt của V9.1 ở mức unit: port 80 -> HTTP được thử trước, nên một
+    request/response HTTP không bao giờ thành SMTP."""
+    assert http() == Detection("HTTP", "port+payload")
+    assert http(sport=80, dport=40470, payload=RESPONSE) == Detection(
+        "HTTP", "port+payload")
+
+
+def test_a_body_fragment_starting_with_three_digits_is_the_known_risk_r5():
+    """Ca ngược của rủi ro R5, ghi lại để khỏi tưởng là bug: một mảnh body HTTP
+    mở đầu bằng "404 " KHÔNG còn chữ ký HTTP nào (đây là giữa luồng), nên chữ ký
+    reply SMTP khớp và event ghi SMTP với detect_method="payload". Chống được ca
+    này cần ghép luồng TCP (ngoài phạm vi, A2); điều bài này làm được là ghi rõ
+    kết luận dựa trên payload để người đọc log biết mà đối chiếu."""
+    assert http(sport=80, dport=40470, payload=b"404 page not found\n") == (
+        Detection("SMTP", "payload"))
+
+
+def test_adding_smtp_did_not_change_http_or_dns_detection():
+    """Hồi quy của NFR-6: registry dài ra nhưng hai giao thức cũ không đổi."""
+    assert http() == Detection("HTTP", "port+payload")
+    assert http(dport=8081) == Detection("HTTP", "payload")
+    assert dns() == Detection("DNS", "port+payload")
+    assert dns(dport=MDNS_PORT) == Detection("DNS", "payload")

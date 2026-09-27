@@ -16,8 +16,9 @@ Nên ADR-5: **port quyết định THỨ TỰ THỬ, payload quyết định K�
 
 Registry `APP_PROTOCOLS` là điểm mở rộng (NFR-6): thêm một giao thức = thêm một
 hàm `matches_*` ngay cạnh đây + một dòng trong tuple. Không sửa `detect()`,
-không sửa parser của giao thức khác. DNS đã vào theo đúng đường đó ở T8.2
-(`git show --stat` của commit: chỉ `detector.py` + test), SMTP sẽ vào ở Phase 9.
+không sửa parser của giao thức khác. DNS vào theo đúng đường đó ở T8.2 và SMTP ở
+T9.2 — `git show --stat` của cả hai commit chỉ có `detector.py` + test (+ dòng
+khai báo AI trong README).
 """
 from dataclasses import dataclass
 from typing import Callable
@@ -25,6 +26,7 @@ from typing import Callable
 from .common import ParseResult
 from .dns import parse_dns, question_section_fits
 from .http import parse_http
+from .smtp import command_at_start, parse_smtp, reply_code_at_start
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,35 @@ def matches_http(payload: bytes) -> bool:
             or payload.startswith(HTTP_RESPONSE_PREFIX))
 
 
+# --- SMTP (Phụ lục C, REQ-9, REQ-11.3) --------------------------------------
+
+def matches_smtp(payload: bytes) -> bool:
+    """True nếu payload mở đầu đúng một trong HAI chữ ký SMTP (Phụ lục C).
+
+    SMTP là giao thức duy nhất trong bài có hai chữ ký khác nhau cho hai chiều,
+    vì nó là giao thức ĐỐI THOẠI theo lượt: client gửi lệnh bằng chữ, server
+    đáp bằng số. HTTP cũng hai chiều nhưng cả hai chiều đều mở đầu bằng chữ
+    ("GET " / "HTTP/1."), còn DNS thì hai chiều dùng CÙNG một khuôn header.
+
+    Cả hai phép kiểm byte-level nằm trong `smtp.py` chứ không viết lại ở đây —
+    cùng lý lẽ với `dns.question_section_fits()`: chúng là văn phạm của SMTP,
+    và registry chỉ được biết "khớp hay không" (NFR-6). Thêm nữa, hai hàm đó
+    được `parse_smtp` dùng lại y nguyên, nên KHÔNG có cách nào để chữ ký nhận
+    diện và parser lệch nhau về định nghĩa "thế nào là một lệnh".
+
+    Rủi ro R5 phải nhận: chữ ký reply chỉ là "3 chữ số + dấu cách hoặc `-`", mà
+    một segment TCP bất kỳ có xác suất không nhỏ mở đầu như thế (vd một mảnh
+    body HTTP bắt đầu bằng "404 "). Ba thứ giữ rủi ro đó ở mức chấp nhận được:
+    (1) port chuẩn được thử TRƯỚC, nên trên :80 thì HTTP luôn được xét trước;
+    (2) `detect_method` ghi lại "payload", nên người đọc log biết kết luận này
+    KHÔNG có port chống lưng; (3) event vẫn giữ nguyên `payload_b64` để soi lại.
+    Thu hẹp thành "chữ số đầu phải 2..5" sẽ giảm rủi ro nhưng khác Phụ lục C
+    (đã chốt) → là một thay đổi đặc tả, không phải một sửa code.
+    """
+    return (reply_code_at_start(payload) is not None
+            or command_at_start(payload) is not None)
+
+
 # --- DNS (Phụ lục C, REQ-8, REQ-11.2) ---------------------------------------
 
 def matches_dns(payload: bytes) -> bool:
@@ -129,15 +160,24 @@ def matches_dns(payload: bytes) -> bool:
 
 # Thứ tự HTTP -> SMTP -> DNS (design §6) là thứ tự thử khi KHÔNG có port nào
 # khớp. Cố định trong mã nguồn -> cùng một payload luôn cho cùng một kết quả,
-# không phụ thuộc thứ tự lặp của dict hay set (NFR-2). SMTP (Phase 9) sẽ xen
-# vào giữa hai dòng dưới đây.
+# không phụ thuộc thứ tự lặp của dict hay set (NFR-2).
 #
-# Thêm DNS vào đây là TOÀN BỘ việc phải làm để pipeline parse được DNS: pipeline
-# lấy hàm parse qua `app_proto_by_name()`, nên không có chỗ nào khác phải sửa —
-# đúng NFR-6, và `http.py` không bị đụng tới.
+# HTTP và SMTP là hai dòng TCP nằm cạnh nhau, nên câu hỏi tự nhiên là "payload
+# nào khớp cả hai?" — câu trả lời là KHÔNG CÓ: chữ ký HTTP mở đầu bằng chữ
+# ("GET " / "HTTP/1."), hai chữ ký SMTP mở đầu bằng một trong 10 lệnh hoặc bằng
+# ba chữ số, và không lệnh nào trong Phụ lục C trùng với một method HTTP. Vậy
+# thứ tự ở đây không đổi được kết quả của bất kỳ payload nào; nó vẫn phải cố
+# định vì tính tất định không được dựa vào một lập luận có thể sai khi bài sau
+# thêm giao thức.
+#
+# Thêm SMTP vào đây là TOÀN BỘ việc phải làm để pipeline parse được SMTP:
+# pipeline lấy hàm parse qua `app_proto_by_name()`, nên không có chỗ nào khác
+# phải sửa — đúng NFR-6, và `http.py`/`dns.py` không bị đụng tới.
 APP_PROTOCOLS = (
     AppProto(name="HTTP", transport="TCP", ports=(80,), matches=matches_http,
              parse=parse_http),
+    AppProto(name="SMTP", transport="TCP", ports=(25,), matches=matches_smtp,
+             parse=parse_smtp),
     AppProto(name="DNS", transport="UDP", ports=(53,), matches=matches_dns,
              parse=parse_dns),
 )
