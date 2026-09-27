@@ -17,7 +17,7 @@ LINKTYPE_LINUX_SLL = 113
 SRC_IP = "10.10.0.10"        # attacker
 DST_IP = "10.20.0.10"        # victim
 PROTO_ICMP, PROTO_TCP, PROTO_UDP = 1, 6, 17
-SYN, ACK = 0x02, 0x10
+SYN, ACK, PSH = 0x02, 0x10, 0x08
 
 
 def eth(ethertype=0x0800, payload=b""):
@@ -370,3 +370,142 @@ def test_handshake_is_distinguishable_end_to_end():
         for i, f in enumerate([SYN, SYN | ACK, ACK], start=1)
     ]
     assert flags == [["SYN"], ["SYN", "ACK"], ["ACK"]]
+
+
+# --- T6.4: detector + parser app (C-4, REQ-10.4, 14.1, 15.4, ADR-14) --------
+
+GET_80 = b"GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nUser-Agent: curl/8.14.1\r\n\r\n"
+RESP_80 = b"HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Length: 3\r\n\r\nhi\n"
+
+
+def test_http_request_on_port_80():
+    event = process_frame(frame_tcp(dst_port=80, flags=PSH | ACK,
+                                    payload=GET_80), 1)
+    assert event["status"] == "ok" and event["errors"] == []
+    assert event["app_proto"] == "HTTP"
+    assert event["detect_method"] == "port+payload"
+    assert event["app"]["kind"] == "request"
+    assert event["app"]["method"] == "GET"
+    assert event["app"]["uri"] == "/"
+    assert event["app"]["headers"][0] == ["Host", "10.20.0.10"]
+
+
+def test_http_response_on_port_80():
+    event = process_frame(frame_tcp(src_port=80, dst_port=40470,
+                                    flags=PSH | ACK, payload=RESP_80), 1)
+    assert event["app_proto"] == "HTTP"
+    assert event["detect_method"] == "port+payload"   # sport=80 cũng tính
+    assert event["app"]["kind"] == "response"
+    assert event["app"]["status_code"] == 200
+    assert event["app"]["method"] is None
+
+
+def test_http_on_nonstandard_port_8081():
+    """TC-13/REQ-11.1 ở mức pipeline: chỉ payload cứu được nhận diện."""
+    event = process_frame(frame_tcp(dst_port=8081, flags=PSH | ACK,
+                                    payload=GET_80), 1)
+    assert event["app_proto"] == "HTTP"
+    assert event["detect_method"] == "payload"
+    assert event["app"]["method"] == "GET"
+    assert event["status"] == "ok"
+
+
+# --- REQ-15.4: payload rỗng ---------------------------------------------------
+
+def test_empty_payload():
+    """Packet ACK trắng của handshake: app_proto null, KHÔNG phải lỗi."""
+    event = process_frame(frame_tcp(flags=ACK), 1)
+    assert event["tcp"]["payload_len"] == 0
+    assert event["app_proto"] is None
+    assert event["detect_method"] is None
+    assert event["app"] is None
+    assert event["errors"] == [] and event["status"] == "ok"
+
+
+# --- payload lạ: UNKNOWN nhưng status vẫn ok (ADR-14, §5.4) ------------------
+
+def test_unknown_payload_keeps_status_ok():
+    event = process_frame(frame_tcp(dst_port=80, flags=PSH | ACK,
+                                    payload=b"\x16\x03\x01\x02\x00rubbish"), 1)
+    assert event["app_proto"] == "UNKNOWN"
+    assert event["detect_method"] is None
+    assert event["app"] is None                  # ADR-14
+    assert event["errors"] == []
+    # app_proto="UNKNOWN" KHÔNG làm status thành unknown: packet đã parse xong
+    # tới hết tầng transport, chỉ là bài 1 chưa biết giao thức ứng dụng này.
+    assert event["status"] == "ok"
+
+
+def test_dns_payload_is_unknown_until_phase_8():
+    """DNS chưa có trong registry -> UNKNOWN, và đó không phải lỗi."""
+    event = process_frame(frame_udp(dst_port=53, payload=b"\x12\x34\x01\x00"), 1)
+    assert event["app_proto"] == "UNKNOWN"
+    assert event["app"] is None and event["errors"] == []
+
+
+def test_http_signature_over_udp_is_unknown():
+    """HTTP đăng ký ở TCP: cùng bytes đó trên UDP không được gán HTTP."""
+    event = process_frame(frame_udp(dst_port=80, payload=GET_80), 1)
+    assert event["app_proto"] == "UNKNOWN"
+
+
+# --- V6.2: parser app báo lỗi -> layer "http", chương trình chạy tiếp --------
+
+def test_bad_http_header_reports_layer_http():
+    payload = b"GET / HTTP/1.1\r\nHost: 10.20.0.10\r\nX: caf\xff\r\n\r\n"
+    event = process_frame(frame_tcp(dst_port=80, flags=PSH | ACK,
+                                    payload=payload), 1)
+    assert [e["layer"] for e in event["errors"]] == ["http"]
+    assert "decode" in event["errors"][0]["reason"]
+    assert event["status"] == "malformed"
+    # Nhận diện vẫn thành công, và app giữ phần đã parse được (§5.4)
+    assert event["app_proto"] == "HTTP"
+    assert event["app"]["method"] == "GET"
+    assert event["app"]["headers"] == [["Host", "10.20.0.10"]]
+    # REQ-14.1: các tầng dưới không bị ảnh hưởng
+    assert event["src_ip"] == SRC_IP and event["dst_port"] == 80
+
+
+def test_incomplete_http_is_not_an_error():
+    """REQ-7.4: header tràn sang segment sau -> cờ incomplete, không phải lỗi."""
+    event = process_frame(frame_tcp(dst_port=80, flags=ACK,
+                                    payload=b"GET / HTTP/1.1\r\nHos"), 1)
+    assert event["errors"] == [] and event["status"] == "ok"
+    assert event["app"]["incomplete"] is True
+
+
+# --- tầng dưới dừng thì tầng app không được chạy -----------------------------
+
+def test_transport_error_stops_before_detection():
+    event = process_frame(frame_tcp(data_offset=15), 1)
+    assert event["app_proto"] is None and event["app"] is None
+
+
+def test_icmp_never_reaches_the_detector():
+    event = process_frame(frame(eth(0x0800, ipv4(b"\x08\x00GET / HTTP/1.1 ",
+                                                 proto=PROTO_ICMP))), 1)
+    assert event["transport_proto"] == "UNKNOWN"
+    assert event["app_proto"] is None            # không đoán khi chưa biết port
+
+
+def test_non_first_fragment_never_reaches_the_detector():
+    """Byte đầu của mảnh thứ hai là dữ liệu, không phải header TCP."""
+    event = process_frame(
+        frame(eth(0x0800, ipv4(b"GET / HTTP/1.1\r\n\r\n" + b"\x00" * 6,
+                               proto=PROTO_TCP, frag_offset=185))), 1)
+    assert event["app_proto"] is None and event["app"] is None
+
+
+# --- app_proto và app luôn nhất quán với nhau (ADR-14, I-2) ------------------
+
+def test_app_is_null_whenever_app_proto_is_not_a_real_protocol():
+    rng = random.Random(20260928)
+    for i in range(300):
+        payload = bytes(rng.randrange(256) for _ in range(rng.randrange(0, 40)))
+        event = process_frame(frame_tcp(dst_port=rng.choice([80, 8081, 25]),
+                                        payload=payload), i + 1)
+        if event["app_proto"] in (None, "UNKNOWN"):
+            assert event["app"] is None
+        else:
+            assert event["app"] is not None
+            assert event["detect_method"] in {"port+payload", "payload"}

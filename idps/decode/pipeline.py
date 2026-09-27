@@ -8,6 +8,7 @@ Bài 1 dựng dần: Phase 2 mới có tầng liên kết, T5.4 nối network/tr
 T6.4 nối detector + app parser.
 """
 from ..core.event import add_error, compute_status, new_event
+from .detector import app_proto_by_name, detect
 from .ethernet import ETHERTYPE_IPV4, link_name, parse_link
 from .ipv4 import PROMOTED_FIELDS, PROTO_TCP, PROTO_UDP, parse_ipv4
 from .tcp import parse_tcp
@@ -124,5 +125,47 @@ def _decode(frame, event: dict) -> None:
         add_error(event, name.lower(), transport.error)
         return
 
-    # transport.payload là bytes dành cho tầng ứng dụng; T6.4 gọi detect() rồi
-    # parser app tại đúng chỗ này.
+    _decode_app(event, name, transport.payload)
+
+
+def _decode_app(event: dict, transport_name: str, payload: bytes) -> None:
+    """Tầng ứng dụng: nhận diện trước, parse sau (ADR-5, REQ-10.4, 15.4).
+
+    Hai bước tách rời nhau vì chúng trả lời hai câu hỏi khác nhau, và câu thứ
+    nhất có thể trả lời được trong khi câu thứ hai thất bại: detect() nói "đây
+    là HTTP" dựa vào 4 byte đầu, parse_http() có thể vẫn báo lỗi ở header thứ 5.
+    Khi đó event vừa có app_proto="HTTP" vừa có errors[].layer="http" — đúng
+    điều một IDS cần: biết giao thức gì để áp luật nào, và biết nó hỏng ở đâu.
+    """
+    detection = detect(transport_name, event["src_port"], event["dst_port"],
+                       payload)
+    # Ghi kết quả nhận diện TRƯỚC khi parse: kể cả parser báo lỗi thì event vẫn
+    # nói được đây là giao thức gì và đã nhận diện bằng cách nào (REQ-10.4).
+    event["app_proto"] = detection.app_proto
+    event["detect_method"] = detection.method
+
+    if detection.app_proto is None or detection.app_proto == "UNKNOWN":
+        # ADR-14: app = null ở cả hai ca. None = payload rỗng (REQ-15.4, không
+        # phải lỗi); "UNKNOWN" = có dữ liệu nhưng không chữ ký nào khớp — cũng
+        # không phải lỗi, chỉ là bài 1 mới có ba giao thức. Vì vậy KHÔNG gọi
+        # add_error, và status vẫn là "ok" (app_proto không nằm trong danh sách
+        # _UNKNOWN_KEYS của event.py).
+        return
+
+    # detect() chỉ trả về tên lấy từ chính APP_PROTOCOLS, nên tra ngược luôn ra
+    # một dòng registry — không cần kiểm None ở đây (NFR-6).
+    proto = app_proto_by_name(detection.app_proto)
+    if proto.parse is None:
+        # Đã nhận ra tên nhưng chưa có parser (AppProto.parse mặc định None).
+        # app giữ null; app_proto vẫn ghi để thống kê và để luật theo port/proto
+        # dùng được ngay. Phase 8/9 điền parser cho DNS/SMTP là hết ca này.
+        return
+
+    app = proto.parse(payload)
+    if app.fields:
+        event["app"] = app.fields
+    if app.error:
+        # Tên tầng là tên giao thức viết thường ("http"), cùng quy ước với
+        # "tcp"/"udp" ở tầng transport -> đọc errors[].layer là biết parser nào
+        # phát hiện lỗi (REQ-15.2, V6.2).
+        add_error(event, detection.app_proto.lower(), app.error)
