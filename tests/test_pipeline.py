@@ -436,8 +436,13 @@ def test_unknown_payload_keeps_status_ok():
     assert event["status"] == "ok"
 
 
-def test_dns_payload_is_unknown_until_phase_8():
-    """DNS chưa có trong registry -> UNKNOWN, và đó không phải lỗi."""
+def test_payload_shorter_than_the_dns_header_is_unknown():
+    """4 byte trên port 53: ngắn hơn header DNS (12 byte) -> UNKNOWN, không lỗi.
+
+    Trước T8.2 ca này ra UNKNOWN vì registry chưa có DNS; bây giờ nó ra UNKNOWN
+    vì đúng điều kiện đầu của chữ ký Phụ lục C. Cùng kết quả, khác lý do — nên
+    tên test được sửa theo lý do mới (như T4.3 đã làm với test của chế độ live).
+    """
     event = process_frame(frame_udp(dst_port=53, payload=b"\x12\x34\x01\x00"), 1)
     assert event["app_proto"] == "UNKNOWN"
     assert event["app"] is None and event["errors"] == []
@@ -509,3 +514,101 @@ def test_app_is_null_whenever_app_proto_is_not_a_real_protocol():
         else:
             assert event["app"] is not None
             assert event["detect_method"] in {"port+payload", "payload"}
+
+
+# --- T8.1/T8.2: DNS đi hết pipeline (REQ-8.1-8.5, REQ-14.1, ADR-14) ----------
+
+def dns_header(ident=0x1234, flags=0x0100, qdcount=1, ancount=0):
+    return struct.pack("!HHHHHH", ident, flags, qdcount, ancount, 0, 0)
+
+
+DNS_NAME = b"\x06victim\x03lab\x00"          # 12 byte, đặt ở offset 12
+DNS_QUESTION = DNS_NAME + struct.pack("!HH", 1, 1)      # hết ở offset 28
+# Answer A hợp lệ: tên nén trỏ về question, TTL 300, RDATA 10.20.0.10.
+DNS_ANSWER_A = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 300, 4) + bytes([10, 20, 0, 10])
+DNS_QUERY = dns_header() + DNS_QUESTION
+DNS_RESPONSE = dns_header(flags=0x8180, ancount=1) + DNS_QUESTION + DNS_ANSWER_A
+
+
+def test_dns_query_through_the_pipeline():
+    """Query trên UDP 53 -> app_proto DNS, app đầy đủ, status ok (REQ-8.1)."""
+    event = process_frame(frame_udp(dst_port=53, payload=DNS_QUERY), 1)
+    assert event["transport_proto"] == "UDP"
+    assert (event["app_proto"], event["detect_method"]) == ("DNS", "port+payload")
+    assert event["app"]["qr"] == "query"
+    assert event["app"]["questions"] == [{"name": "victim.lab", "type": "A"}]
+    assert event["status"] == "ok" and event["errors"] == []
+
+
+def test_dns_response_through_the_pipeline():
+    """Response từ server (sport=53) -> answer có name giải từ con trỏ (REQ-8.2)."""
+    event = process_frame(frame_udp(src_port=53, dst_port=41234,
+                                    payload=DNS_RESPONSE), 1)
+    assert (event["app_proto"], event["detect_method"]) == ("DNS", "port+payload")
+    assert event["app"]["answers"] == [
+        {"name": "victim.lab", "type": "A", "ttl": 300, "data": "10.20.0.10"},
+    ]
+    assert event["status"] == "ok"
+
+
+def test_dns_on_nonstandard_port_through_the_pipeline():
+    """REQ-11.2: cùng message đó trên port 5353 -> vẫn DNS, nhưng detect khác."""
+    event = process_frame(frame_udp(dst_port=5353, payload=DNS_QUERY), 1)
+    assert (event["app_proto"], event["detect_method"]) == ("DNS", "payload")
+
+
+@pytest.mark.parametrize("bad_name, label", [
+    (struct.pack("!H", 0xC000 | 28), "con trỏ tự trỏ vào chính nó"),
+    (struct.pack("!H", 0xC000 | 9999), "con trỏ ra ngoài payload"),
+])
+def test_bad_pointer_in_an_answer_makes_the_event_malformed(bad_name, label):
+    """REQ-8.4 ở mức event: lỗi tầng dns, KHÔNG có internal, giữ question."""
+    payload = (dns_header(flags=0x8180, ancount=1) + DNS_QUESTION + bad_name
+               + struct.pack("!HHIH", 1, 1, 300, 4) + bytes([10, 20, 0, 10]))
+    event = process_frame(frame_udp(src_port=53, dst_port=41234,
+                                    payload=payload), 1)
+    assert event["status"] == "malformed", label
+    assert [e["layer"] for e in event["errors"]] == ["dns"]
+    # ADR-4: packet hỏng đi đường ParseResult.error, không phải exception.
+    assert "internal" not in [e["layer"] for e in event["errors"]]
+    # REQ-14.1: những gì đã parse được vẫn còn trong event.
+    assert event["app_proto"] == "DNS"
+    assert event["app"]["questions"] == [{"name": "victim.lab", "type": "A"}]
+    assert event["src_port"] == 53 and event["dst_port"] == 41234
+
+
+def test_ancount_larger_than_actual_keeps_the_parsed_answer():
+    """REQ-8.5 ở mức event: ANCOUNT=5, 1 answer thật -> malformed + giữ answer."""
+    payload = (dns_header(flags=0x8180, ancount=5) + DNS_QUESTION + DNS_ANSWER_A)
+    event = process_frame(frame_udp(src_port=53, dst_port=41234,
+                                    payload=payload), 1)
+    assert event["status"] == "malformed"
+    assert [e["layer"] for e in event["errors"]] == ["dns"]
+    assert event["app"]["ancount"] == 5                  # con số bên gửi khai
+    assert len(event["app"]["answers"]) == 1             # bản ghi đọc được
+    assert event["app"]["answers"][0]["data"] == "10.20.0.10"
+
+
+@pytest.mark.parametrize("bad_name", [
+    struct.pack("!H", 0xC000 | 12),                      # tự trỏ vào chính nó
+    struct.pack("!H", 0xC000 | 9999),                    # ra ngoài payload
+])
+def test_bad_pointer_in_the_question_is_unknown_not_malformed(bad_name):
+    """Ranh giới cần biết: con trỏ xấu trong QUESTION -> UNKNOWN, không malformed.
+
+    Chữ ký DNS của Phụ lục C là "toàn bộ phần question parse được". Nếu chính
+    phần question hỏng thì `matches_dns()` trả False -> detector không gán DNS,
+    nên không có parser nào chạy và không có lỗi nào để ghi: event là
+    `app_proto="UNKNOWN"`, `status="ok"`.
+
+    Nói cách khác, REQ-8.4 ("đánh dấu malformed") chỉ có hiệu lực khi message đã
+    được NHẬN DIỆN là DNS — tức con trỏ xấu nằm ở answer hoặc trong RDATA của
+    CNAME/NS/PTR (hai test ngay trên). Phần quan trọng nhất của REQ-8.4 vẫn đúng
+    ở cả hai ca: parser dừng ngay, không treo, và không có lỗi `internal`.
+    """
+    payload = dns_header() + bad_name + struct.pack("!HH", 1, 1)
+    event = process_frame(frame_udp(dst_port=53, payload=payload), 1)
+    assert event["app_proto"] == "UNKNOWN"
+    assert event["detect_method"] is None
+    assert event["app"] is None
+    assert event["status"] == "ok" and event["errors"] == []
