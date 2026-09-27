@@ -76,3 +76,4 @@ và cập nhật trong suốt quá trình làm bài.
 | `lab/victim/Dockerfile` | AI chọn base image, viết danh sách gói, giải thích vì sao đổ log nginx ra stdout thay vì cấp thêm capability; tôi đọc hiểu, build và tự kiểm tra HTTP 200 trên cả hai port |
 | `lab/victim/site.conf` | AI viết cấu hình hai port và `location /submit` để nhận POST, giải thích vì sao nginx trả 405 cho POST vào file tĩnh; tôi đọc hiểu và tự thử `curl -X POST` |
 | `lab/victim/dnsmasq.conf` | AI viết cấu hình zone lab và giải thích `no-resolv`, `bind-interfaces`, vì sao phải đặt `local-ttl` khác 0 để TC-08 có giá trị; tôi đọc hiểu và tự kiểm bằng `dig` |
+| `lab/victim/start.sh` | AI viết script khởi động ba dịch vụ và giải thích tiến trình nào giữ foreground, vì sao `exec nginx` làm PID 1, cờ `-n` của aiosmtpd; tôi đọc hiểu và tự kiểm bằng `nc` |

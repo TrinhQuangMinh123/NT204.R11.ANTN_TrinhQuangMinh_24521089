@@ -56,6 +56,9 @@ services:
   victim:
     build: ./lab/victim
     image: idps-victim
+    # Mặc định hostname là container id ngẫu nhiên → banner SMTP đổi mỗi lần
+    # tạo lại container, bằng chứng TC-09/TC-10 không lặp lại được (REQ-19.6)
+    hostname: victim.lab
     # Danh sách này tìm bằng cách bỏ hết rồi đọc log nginx, thêm từng vé đang thiếu:
     # NET_ADMIN         tự thêm route về mạng attacker
     # NET_BIND_SERVICE  bind port 80 (< 1024)
@@ -68,8 +71,8 @@ services:
       net_int:
         ipv4_address: 10.20.0.10
     depends_on: [idps]
-    # nginx chạy foreground để làm PID 1 → nhận SIGTERM khi compose down
-    command: ["sh", "-c", "ip route add 10.10.0.0/24 via 10.20.0.254 && ip route del default && dnsmasq && exec nginx -g 'daemon off;'"]
+    # start.sh chạy dnsmasq + aiosmtpd + nginx; nginx giữ PID 1 (xem lab/victim/start.sh)
+    command: ["sh", "-c", "ip route add 10.10.0.0/24 via 10.20.0.254 && ip route del default && exec /usr/local/bin/start.sh"]
 
 # Đường duy nhất giữa hai mạng là xuyên qua idps (REQ-19.5). Tính chất đó KHÔNG
 # dựa vào internal: true (luật DOCKER-INTERNAL của Docker chặn luôn cả đường qua
