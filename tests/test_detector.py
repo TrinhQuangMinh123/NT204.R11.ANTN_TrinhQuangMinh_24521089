@@ -7,6 +7,7 @@ import pytest
 from idps.decode.detector import (APP_PROTOCOLS, HTTP_METHODS, AppProto,
                                   Detection, app_proto_by_name, detect,
                                   matches_http)
+from idps.decode.http import parse_http
 
 GET = b"GET / HTTP/1.1\r\nHost: 10.20.0.10\r\n\r\n"
 RESPONSE = b"HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\nhi"
@@ -179,3 +180,12 @@ def test_registry_names_are_unique():
 def test_protocol_entry_is_immutable():
     with pytest.raises(dataclasses.FrozenInstanceError):
         APP_PROTOCOLS[0].ports = (8081,)
+
+
+# --- T6.3: dòng registry trỏ tới parser thật ---------------------------------
+
+def test_http_registry_entry_points_at_the_http_parser():
+    """NFR-6: pipeline lấy parser QUA registry, không giữ bảng riêng."""
+    proto = app_proto_by_name("HTTP")
+    assert proto.parse is parse_http
+    assert proto.parse(GET).fields["method"] == "GET"

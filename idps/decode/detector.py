@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .common import ParseResult
+from .http import parse_http
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,8 @@ def matches_http(payload: bytes) -> bool:
 # khớp. Cố định trong mã nguồn -> cùng một payload luôn cho cùng một kết quả,
 # không phụ thuộc thứ tự lặp của dict hay set (NFR-2).
 APP_PROTOCOLS = (
-    AppProto(name="HTTP", transport="TCP", ports=(80,), matches=matches_http),
+    AppProto(name="HTTP", transport="TCP", ports=(80,), matches=matches_http,
+             parse=parse_http),
 )
 
 
