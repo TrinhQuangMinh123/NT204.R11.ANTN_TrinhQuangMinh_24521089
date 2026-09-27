@@ -75,3 +75,4 @@ và cập nhật trong suốt quá trình làm bài.
 | `lab/attacker/Dockerfile` | AI chọn base image cùng họ Debian với sensor và viết danh sách gói kèm lý do từng gói, giải thích `--no-install-recommends`; tôi đọc hiểu, build và tự kiểm tra route, ping |
 | `lab/victim/Dockerfile` | AI chọn base image, viết danh sách gói, giải thích vì sao đổ log nginx ra stdout thay vì cấp thêm capability; tôi đọc hiểu, build và tự kiểm tra HTTP 200 trên cả hai port |
 | `lab/victim/site.conf` | AI viết cấu hình hai port và `location /submit` để nhận POST, giải thích vì sao nginx trả 405 cho POST vào file tĩnh; tôi đọc hiểu và tự thử `curl -X POST` |
+| `lab/victim/dnsmasq.conf` | AI viết cấu hình zone lab và giải thích `no-resolv`, `bind-interfaces`, vì sao phải đặt `local-ttl` khác 0 để TC-08 có giá trị; tôi đọc hiểu và tự kiểm bằng `dig` |

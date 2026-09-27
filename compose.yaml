@@ -69,7 +69,7 @@ services:
         ipv4_address: 10.20.0.10
     depends_on: [idps]
     # nginx chạy foreground để làm PID 1 → nhận SIGTERM khi compose down
-    command: ["sh", "-c", "ip route add 10.10.0.0/24 via 10.20.0.254 && ip route del default && exec nginx -g 'daemon off;'"]
+    command: ["sh", "-c", "ip route add 10.10.0.0/24 via 10.20.0.254 && ip route del default && dnsmasq && exec nginx -g 'daemon off;'"]
 
 # Đường duy nhất giữa hai mạng là xuyên qua idps (REQ-19.5). Tính chất đó KHÔNG
 # dựa vào internal: true (luật DOCKER-INTERNAL của Docker chặn luôn cả đường qua

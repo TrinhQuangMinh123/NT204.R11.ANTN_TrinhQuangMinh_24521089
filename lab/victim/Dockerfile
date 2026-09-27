@@ -3,9 +3,9 @@
 # container này, khi đó cần apt của Debian và một script khởi động tự viết.
 FROM debian:13-slim
 
-# nginx: dịch vụ HTTP (TC-04, 05, 06, 13) · iproute2: đặt route về mạng attacker
+# nginx: HTTP (TC-04, 05, 06, 13) · dnsmasq: DNS (TC-07, 08) · iproute2: đặt route
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nginx iproute2 \
+ && apt-get install -y --no-install-recommends nginx dnsmasq iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Body ngắn và cố định để response HTTP trong test luôn giống nhau từng byte
@@ -14,6 +14,10 @@ RUN printf 'victim lab\n' > /var/www/html/index.html
 # Thay site mặc định của Debian bằng cấu hình của mình
 RUN rm -f /etc/nginx/sites-enabled/default
 COPY site.conf /etc/nginx/conf.d/site.conf
+
+# Gói dnsmasq của Debian tự bật một service riêng với cấu hình mặc định; ta chỉ
+# dùng file của mình và tự gọi dnsmasq từ command trong compose.yaml.
+COPY dnsmasq.conf /etc/dnsmasq.conf
 
 # Log ra stdout/stderr thay vì file. Hai lý do: (1) /var/log/nginx/*.log thuộc
 # www-data:adm mode 640 nên nginx master (root) không mở được khi đã bỏ
