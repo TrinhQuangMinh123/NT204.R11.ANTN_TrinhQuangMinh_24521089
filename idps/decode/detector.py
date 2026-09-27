@@ -14,14 +14,16 @@ Nên ADR-5: **port quyết định THỨ TỰ THỬ, payload quyết định K�
     viên đầu, ca port lạ vẫn ra đúng kết quả, và `detect_method` ghi lại được
     chương trình đã dựa vào đâu (REQ-10.4).
 
-Registry `APP_PROTOCOLS` là điểm mở rộng (NFR-6): thêm SMTP/DNS ở Phase 9/8 =
-thêm một hàm `matches_*` ngay cạnh đây + một dòng trong tuple. Không sửa
-`detect()`, không sửa parser của giao thức khác.
+Registry `APP_PROTOCOLS` là điểm mở rộng (NFR-6): thêm một giao thức = thêm một
+hàm `matches_*` ngay cạnh đây + một dòng trong tuple. Không sửa `detect()`,
+không sửa parser của giao thức khác. DNS đã vào theo đúng đường đó ở T8.2
+(`git show --stat` của commit: chỉ `detector.py` + test), SMTP sẽ vào ở Phase 9.
 """
 from dataclasses import dataclass
 from typing import Callable
 
 from .common import ParseResult
+from .dns import parse_dns, question_section_fits
 from .http import parse_http
 
 
@@ -99,14 +101,45 @@ def matches_http(payload: bytes) -> bool:
             or payload.startswith(HTTP_RESPONSE_PREFIX))
 
 
+# --- DNS (Phụ lục C, REQ-8, REQ-11.2) ---------------------------------------
+
+def matches_dns(payload: bytes) -> bool:
+    """True nếu payload có cấu trúc DNS hợp lệ (Phụ lục C).
+
+    Đây là giao thức DUY NHẤT trong bài không nhận diện được bằng vài byte đầu:
+    2 byte đầu của message DNS là transaction ID, tức **cả 65536 giá trị đều
+    hợp lệ** — không có chuỗi mở đầu nào như `GET ` của HTTP hay `220 ` của
+    SMTP. Vì vậy chữ ký phải là "cấu trúc TỰ NHẤT QUÁN": header ≥ 12 byte,
+    QDCOUNT ≥ 1, và toàn bộ phần question giải được trong phạm vi payload.
+
+    Nói cách khác: nhận diện DNS = **thử parse phần question**. Công việc
+    byte-level đó nằm trong `dns.question_section_fits()` chứ không viết lại ở
+    đây, vì nó thuộc về parser của DNS; registry chỉ cần biết "khớp hay không"
+    (NFR-6).
+
+    Hệ quả cần bảo vệ khi vấn đáp: chữ ký này **có thể** nhận nhầm một payload
+    UDP ngẫu nhiên đủ ngắn (rủi ro R5 của design). Đó là lý do nó vẫn phải đi
+    kèm điều kiện QDCOUNT ≥ 1 và parse trọn question — mỗi điều kiện thêm vào
+    làm xác suất trùng hợp nhỏ đi một bậc.
+    """
+    return question_section_fits(payload)
+
+
 # --- Registry ---------------------------------------------------------------
 
 # Thứ tự HTTP -> SMTP -> DNS (design §6) là thứ tự thử khi KHÔNG có port nào
 # khớp. Cố định trong mã nguồn -> cùng một payload luôn cho cùng một kết quả,
-# không phụ thuộc thứ tự lặp của dict hay set (NFR-2).
+# không phụ thuộc thứ tự lặp của dict hay set (NFR-2). SMTP (Phase 9) sẽ xen
+# vào giữa hai dòng dưới đây.
+#
+# Thêm DNS vào đây là TOÀN BỘ việc phải làm để pipeline parse được DNS: pipeline
+# lấy hàm parse qua `app_proto_by_name()`, nên không có chỗ nào khác phải sửa —
+# đúng NFR-6, và `http.py` không bị đụng tới.
 APP_PROTOCOLS = (
     AppProto(name="HTTP", transport="TCP", ports=(80,), matches=matches_http,
              parse=parse_http),
+    AppProto(name="DNS", transport="UDP", ports=(53,), matches=matches_dns,
+             parse=parse_dns),
 )
 
 

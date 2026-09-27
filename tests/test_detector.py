@@ -6,7 +6,8 @@ import pytest
 
 from idps.decode.detector import (APP_PROTOCOLS, HTTP_METHODS, AppProto,
                                   Detection, app_proto_by_name, detect,
-                                  matches_http)
+                                  matches_dns, matches_http)
+from idps.decode.dns import parse_dns
 from idps.decode.http import parse_http
 
 GET = b"GET / HTTP/1.1\r\nHost: 10.20.0.10\r\n\r\n"
@@ -189,3 +190,91 @@ def test_http_registry_entry_points_at_the_http_parser():
     proto = app_proto_by_name("HTTP")
     assert proto.parse is parse_http
     assert proto.parse(GET).fields["method"] == "GET"
+
+
+# --- T8.2: DNS (REQ-10.2, 11.2, Phụ lục C, NFR-6) ---------------------------
+
+# Query "victim.lab" A, đúng message mà `dig` gửi trong lab (xem TEST/TC-07).
+DNS_QUERY = bytes.fromhex(
+    "1234" "0100" "0001" "0000" "0000" "0000"      # header: 1 question
+    "06" "7669" "6374696d" "03" "6c6162" "00"      # victim.lab
+    "0001" "0001"                                  # QTYPE A, QCLASS IN
+)
+# Response cho chính query đó, answer dùng tên nén 0xC00C.
+DNS_RESPONSE = DNS_QUERY[:2] + bytes.fromhex(
+    "8180" "0001" "0001" "0000" "0000"
+    "06" "7669" "6374696d" "03" "6c6162" "00" "0001" "0001"
+    "c00c" "0001" "0001" "0000012c" "0004" "0a14000a"      # A 10.20.0.10, TTL 300
+)
+DNS_PORT = 53
+MDNS_PORT = 5353             # port lạ nhưng payload vẫn là DNS (REQ-11.2)
+
+
+def dns(sport=40470, dport=DNS_PORT, payload=DNS_QUERY, transport="UDP"):
+    return detect(transport, sport, dport, payload)
+
+
+def test_dns_query_on_port_53():
+    assert dns() == Detection("DNS", "port+payload")
+
+
+def test_dns_response_direction():
+    """sport=53: response từ server về — cùng lý do như HTTP, xét cả hai port."""
+    assert dns(sport=DNS_PORT, dport=40470, payload=DNS_RESPONSE) == Detection(
+        "DNS", "port+payload")
+
+
+def test_dns_on_nonstandard_port():
+    """REQ-11.2: payload DNS hợp lệ trên port 5353 -> nhận nhờ payload."""
+    assert dns(dport=MDNS_PORT) == Detection("DNS", "payload")
+    assert dns(sport=MDNS_PORT, dport=MDNS_PORT) == Detection("DNS", "payload")
+
+
+def test_eleven_bytes_on_port_53_is_unknown():
+    """Ngắn hơn header DNS (12 byte) -> UNKNOWN, dù port khớp (REQ-10.2)."""
+    assert dns(payload=b"\x00" * 11) == Detection("UNKNOWN", None)
+
+
+def test_qdcount_zero_on_port_53_is_unknown():
+    """Đủ 12 byte nhưng QDCOUNT=0: không có question nào để kiểm -> không gán."""
+    payload = bytes.fromhex("1234" "0100" "0000" "0000" "0000" "0000")
+    assert dns(payload=payload) == Detection("UNKNOWN", None)
+
+
+def test_truncated_question_on_port_53_is_unknown():
+    """Header hợp lệ nhưng question bị cắt -> cấu trúc không tự nhất quán."""
+    assert dns(payload=DNS_QUERY[:-3]) == Detection("UNKNOWN", None)
+
+
+def test_dns_signature_is_not_applied_to_tcp():
+    """Cùng bytes đó trên TCP: DNS trong bài chỉ chạy trên UDP (A3)."""
+    assert dns(transport="TCP", payload=DNS_QUERY) == Detection("UNKNOWN", None)
+
+
+def test_http_payload_on_udp_53_is_unknown():
+    """Chữ ký HTTP không được dùng cho UDP, và GET không phải DNS hợp lệ."""
+    assert dns(payload=GET) == Detection("UNKNOWN", None)
+
+
+def test_matches_dns_directly():
+    assert matches_dns(DNS_QUERY) is True
+    assert matches_dns(DNS_RESPONSE) is True
+    assert matches_dns(b"") is False
+    assert matches_dns(GET) is False
+
+
+def test_dns_registry_entry_points_at_the_dns_parser():
+    """NFR-6: pipeline lấy parser QUA registry — không có bảng thứ hai."""
+    proto = app_proto_by_name("DNS")
+    assert proto.parse is parse_dns
+    assert proto.transport == "UDP" and proto.ports == (DNS_PORT,)
+    assert proto.parse(DNS_QUERY).fields["questions"] == [
+        {"name": "victim.lab", "type": "A"},
+    ]
+
+
+def test_adding_dns_did_not_change_http_detection():
+    """Hồi quy của NFR-6: registry dài ra nhưng kết quả của HTTP không đổi."""
+    assert http() == Detection("HTTP", "port+payload")
+    assert http(dport=8081) == Detection("HTTP", "payload")
+    assert http(payload=b"\x16\x03\x01\x00\x95") == Detection("UNKNOWN", None)
