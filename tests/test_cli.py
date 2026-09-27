@@ -105,11 +105,45 @@ def test_pcapng_rejected(tmp_path):
     assert "PCAPNG" in result.stderr
 
 
-def test_live_mode_is_not_implemented_yet(tmp_path):
-    """Phase 4 thay bằng LiveSource; tới lúc đó phải báo rõ chứ không im lặng."""
-    result = run_cli("--interface", "int0", "-o", tmp_path / "out.jsonl")
+# --- lỗi nguồn của chế độ live: exit 1 (REQ-1.4, 1.5, 18.5) -----------------
+
+def test_live_interface_not_found(tmp_path):
+    """REQ-1.4: interface không tồn tại -> exit 1 và thông báo nêu đúng tên."""
+    result = run_cli("--interface", "nope0", "-o", tmp_path / "out.jsonl")
     assert result.returncode == 1
-    assert "int0" in result.stderr
+    assert "nope0" in result.stderr
+    assert "no such interface" in result.stderr
+    assert result.stdout == ""                      # không in dòng thống kê
+
+
+def test_live_interface_name_with_slash(tmp_path):
+    """Tên interface đi vào đường dẫn /sys -> "/" phải bị chặn, không lần theo.
+
+    Tên interface của Linux không chứa "/" bao giờ, nên "lo/../../etc" chỉ có
+    thể là gõ sai hoặc cố tình; chặn ở LiveSource.__init__ trước khi mở file.
+    """
+    result = run_cli("--interface", "lo/../../etc", "-o", tmp_path / "out.jsonl")
+    assert result.returncode == 1
+    assert "invalid interface name" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="chỉ có nghĩa khi chạy không có CAP_NET_RAW (service idps-offline)",
+)
+def test_live_without_capability(tmp_path):
+    """REQ-1.5, REQ-18.5: thiếu CAP_NET_RAW -> exit 1 ngay, không treo.
+
+    Bắt trên `lo`: interface này có trong mọi container kể cả
+    `network_mode: none`, nên ca lỗi kiểm đúng chuyện QUYỀN chứ không lẫn với
+    chuyện interface không tồn tại. Trong `idps-offline` (cap_drop: [ALL],
+    uid của host) việc mở AF_PACKET thất bại với EPERM.
+    """
+    result = run_cli("--interface", "lo", "-o", tmp_path / "out.jsonl")
+    assert result.returncode == 1
+    assert "permission" in result.stderr.lower()
+    assert "lo" in result.stderr
+    assert result.stdout == ""
 
 
 # --- lỗi output: exit 1 TRƯỚC khi đọc packet (REQ-13.4) ---------------------
