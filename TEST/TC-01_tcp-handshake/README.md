@@ -32,6 +32,15 @@ cách mở (RFC 9293), nên ba packet đầu **bắt buộc** là SYN → SYN/AC
 
 `-U` (ghi từng packet, không đệm) để file vẫn hợp lệ khi `timeout` gửi SIGTERM cho `tcpdump`.
 
+> **Cảnh báo khi chạy lại lệnh trên (thêm 2026-09-27, sau T7.1).** `timeout 12` trong container **không
+> đáng tin trên máy WSL2 này**: nó đã một lần không bắn SIGALRM (`/proc/<pid>/timers` còn treo
+> `signal: 14` sau hơn một giờ), nên `tcpdump` sống sót và **vẫn giữ fd ghi vào chính
+> `TEST/TC-01_tcp-handshake/input.pcap`** — traffic của test case ghi sau đó bị ghi thêm vào file bằng
+> chứng này (phát hiện bằng `git status`, đã `git restore` về đúng blob `md5 a138617f…`). Từ TC-02 trở
+> đi mọi test case dùng `tcpdump -c <số packet>` để tcpdump **tự thoát**; xem
+> `TEST/TC-02_tcp-data/README.md` §2. Nếu chạy lại TC-01, nên thay `timeout 12` bằng `-c 10` và kiểm
+> `ps -ef | grep tcpdump` rỗng sau khi bắt xong.
+
 Chạy parser:
 
 ```sh
