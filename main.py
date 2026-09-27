@@ -8,9 +8,11 @@ Thông báo và trợ giúp viết bằng tiếng Anh cho đồng nhất với p
 in ra (usage/error) và với thông báo lỗi của hệ điều hành.
 """
 import argparse
+import signal
 import sys
 
 from idps.capture import SourceError
+from idps.capture.live import LiveSource
 from idps.capture.pcap import PcapSource
 from idps.core.runner import Runner
 from idps.decode.pipeline import process_frame
@@ -54,13 +56,38 @@ def build_sinks(args) -> list:
 
 
 def build_source(args):
-    """Chọn nguồn theo mode. Ném SourceError nếu nguồn không dùng được."""
+    """Chọn nguồn theo mode. Ném SourceError nếu nguồn không dùng được.
+
+    Hai nguồn có cùng hợp đồng `frames() -> Iterator[RawFrame]` (design §6),
+    nên đây là chỗ DUY NHẤT trong chương trình phân biệt live với pcap — mọi
+    tầng sau nó xử lý một frame của lab y như một frame đọc từ file (REQ-3.2).
+    """
     if args.pcap is not None:
         return PcapSource(args.pcap)
-    # T4.1/T4.2 thay dòng này bằng LiveSource(args.interface). Để nguyên một
-    # lỗi rõ ràng thay vì bỏ trống: chạy --interface bây giờ phải nói được là
-    # chưa có, chứ không im lặng ghi ra file rỗng.
-    raise SourceError(f"live capture is not implemented yet: --interface {args.interface}")
+    return LiveSource(args.interface)
+
+
+def on_sigterm(signum, frame):
+    """SIGTERM -> KeyboardInterrupt, để dừng êm đi chung một đường (ADR-8).
+
+    Ba lý do phải tự đăng ký thay vì để mặc định:
+
+    1. Tiến trình chạy làm PID 1 của container (`docker compose up` gọi thẳng
+       chương trình) KHÔNG có hành vi mặc định cho SIGTERM: kernel chỉ giao
+       tín hiệu cho PID 1 nếu nó đã cài handler. Không cài thì `docker compose
+       stop` gửi SIGTERM, đợi hết thời gian chờ rồi SIGKILL — mất dòng thống kê
+       và mất luôn cơ hội đóng sink.
+    2. Kể cả khi không phải PID 1 (`docker compose exec`), hành vi mặc định là
+       chết ngay, không chạy `finally` nào.
+    3. Ctrl+C (SIGINT) đã có sẵn đường đi này vì Python biến nó thành
+       KeyboardInterrupt. Biến SIGTERM thành cùng một ngoại lệ thì chỉ có MỘT
+       đường dừng phải test và phải giải thích, thay vì hai (REQ-1.6, 1.7).
+
+    Ném ngoại lệ từ trong handler là cách duy nhất cắt được vòng lặp đang chờ
+    trong `recv`: syscall bị ngắt, Python chạy handler rồi ném tại đúng chỗ
+    đang chờ, nên `with` của LiveSource và `finally` của Runner đều chạy.
+    """
+    raise KeyboardInterrupt
 
 
 def fail(message: str) -> int:
@@ -70,6 +97,11 @@ def fail(message: str) -> int:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Đăng ký trước khi mở tài nguyên nào. Cửa sổ còn hở: SIGTERM đến đúng lúc
+    # đang dựng sink/nguồn thì KeyboardInterrupt lọt ra khỏi main() -> exit
+    # khác 0, nhưng lúc đó chưa có event nào được ghi nên không mất dữ liệu.
+    signal.signal(signal.SIGTERM, on_sigterm)
 
     # Sink TRƯỚC nguồn (REQ-13.4, 20.4, §8.2): chạy live 10 phút rồi mới phát
     # hiện không ghi được file là mất trắng. Bắt Exception chứ không chỉ
