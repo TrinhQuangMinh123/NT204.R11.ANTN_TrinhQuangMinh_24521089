@@ -151,16 +151,19 @@ gói trực tiếp, nên nhãn thời gian và số hiệu cổng của lần ch
 
 ## 3. Chức năng dự kiến
 
-| # | Task | Trạng thái |
-|---|------|-----------|
-| 1 | Thu thập packet | ☐ |
-| 2 | Parser TCP, UDP | ☐ |
-| 3 | Parser DNS, HTTP | ☐ |
-| 4 | Trích xuất feature | ☐ |
-| 5 | Phát hiện port scan | ☐ |
-| 6 | Cảnh báo và ghi log | ☐ |
-| 7 | Chức năng chặn (IPS) | ☐ |
-| 8 | Test cases | ☐ |
+| # | Task | Trạng thái | Bằng chứng / ghi chú |
+|---|------|-----------|---|
+| 1 | Thu thập packet | ☑ | `idps/capture/live.py` (AF_PACKET), `idps/capture/pcap.py`; live và PCAP cho cùng kết quả — `TEST/E2E-01_live-vs-pcap/` |
+| 2 | Parser TCP, UDP | ☑ | `idps/decode/tcp.py`, `udp.py` (và `ethernet.py`, `ipv4.py` bên dưới); TC-01, TC-02, TC-03 |
+| 3 | Parser DNS, HTTP | ☑ | `idps/decode/http.py`, `dns.py`, thêm `smtp.py` ngoài yêu cầu; TC-04…TC-08, TC-09, TC-10, TC-13 |
+| 4 | Trích xuất feature | ☐ | bài sau; mọi event đã có đủ 5-tuple để ghép theo flow |
+| 5 | Phát hiện port scan | ☐ | bài sau |
+| 6 | Cảnh báo và ghi log | ☐ | bài sau; bài 1 đã có bộ ghi JSON Lines `idps/output/jsonl.py` |
+| 7 | Chức năng chặn (IPS) | ☐ | bài sau; sẽ cần thêm capability `NET_ADMIN` cho cảm biến |
+| 8 | Test cases | ☑ | phạm vi bài 1: 14 test case trong `TEST/` (13 TC + 1 E2E), 595 test đơn vị trong `tests/` |
+
+Packet lạ và packet hỏng cũng có bằng chứng riêng: TC-11 (`UNKNOWN` ở cả bốn tầng), TC-12 (10 loại lỗi,
+0 lỗi `internal`, exit 0).
 
 ## 4. Quy trình phát triển
 
@@ -255,3 +258,7 @@ và cập nhật trong suốt quá trình làm bài.
 | `TEST/TC-07_dns-query/README.md` | AI soạn mô tả test case (thêm truy vấn ngoài zone để có `rcode=REFUSED` và ca `ancount=0`; giải thích đối chiếu từng byte của header DNS trong hex, vì sao tên trên dây không có dấu chấm mà là byte độ dài trước mỗi nhãn, vì sao transaction ID là thứ duy nhất ghép response với query trên UDP); tôi tự chạy lại hai truy vấn và tự đối chiếu hex với các trường trong event |
 | `TEST/TC-08_dns-response/README.md` | AI soạn mô tả test case (hỏi `www.victim.lab` để tên answer dài hơn nên nén tên đáng giá hơn; bảng giải từng byte của packet response, giải thích bit `11` của `c0 0c` và ba cách cài sai — coi `c0` là độ dài, đệ quy, vòng lặp không kiểm; nhắc lại vì sao `local-ttl=300` được thêm từ T1.5); tôi tự chạy lại hai truy vấn và tự đối chiếu bảng byte với `payload_b64` |
 | `TEST/E2E-01_live-vs-pcap/README.md` | AI soạn mô tả test case (chỉ ra kế hoạch ban đầu "tcpdump trong attacker" không đo được REQ-3.2 vì router viết lại MAC và giảm TTL, đề xuất cho tcpdump dùng chung network namespace của sensor; đo chênh lệch timestamp và nêu rõ phần chưa chứng minh được); tôi tự chạy lại khối lệnh §2, tự kiểm `diff` rỗng và tự đọc lại 42 event |
+| `idps/__init__.py` | Tệp **rỗng** (0 byte). AI tạo để `idps/` là package thường (không phải namespace package) → `import idps.core.event` xác định được nguồn gốc, và `tests/test_layering.py` quét được cả cây import; không có dòng mã nào để giải thích |
+| `idps/core/__init__.py` | Tệp **rỗng** (0 byte), cùng lý do như `idps/__init__.py` |
+| `idps/decode/__init__.py` | Tệp **rỗng** (0 byte), cùng lý do như `idps/__init__.py` |
+| `idps/output/__init__.py` | Tệp **rỗng** (0 byte), cùng lý do như `idps/__init__.py` |
