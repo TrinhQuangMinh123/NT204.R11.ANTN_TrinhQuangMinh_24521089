@@ -16,12 +16,138 @@ Ngoài phạm vi: machine learning, giao diện web, hiệu năng mức producti
 
 ## 2. Kiến trúc tổng quan
 
-Toàn bộ hệ thống chạy bằng **Docker Compose**: các thành phần được đóng gói thành container và đặt trên
-cùng một mạng ảo, gồm cảm biến IDS/IPS, máy mục tiêu và nguồn sinh traffic. Cách này cho phép tái hiện
-lại từng kịch bản tấn công một cách lặp lại được và thu kết quả test trong môi trường cô lập.
+Toàn bộ hệ thống chạy bằng **Docker Compose**: bốn service trên hai mạng ảo, trong đó cảm biến
+(`idps`) nằm **giữa** hai mạng và là đường đi duy nhất giữa chúng. Nhờ vậy mọi gói attacker ↔ victim
+đều buộc phải đi qua cảm biến, và từng kịch bản test tái hiện lại được trong môi trường cô lập.
 
-Danh sách service, cấu hình mạng và công nghệ cụ thể của từng thành phần sẽ được bổ sung vào tài liệu
-khi triển khai.
+```
+        net_ext 10.10.0.0/24                       net_int 10.20.0.0/24
+   ┌──────────────┐                 ┌───────────┐                 ┌──────────────┐
+   │   attacker   │ eth0       ext0 │   idps    │ int0       eth0 │    victim    │
+   │  10.10.0.10  │────────────────►│ .254/.254 │────────────────►│  10.20.0.10  │
+   │ curl dig nc  │                 │  sensor   │                 │ nginx dnsmasq│
+   │   tcpdump    │                 │  (router) │                 │   aiosmtpd   │
+   └──────────────┘                 └─────┬─────┘                 └──────────────┘
+                                          │ main.py --interface int0
+                                          ▼
+                                   events JSON Lines
+   ┌──────────────┐
+   │ idps-offline │  main.py --pcap TEST/<tc>/input.pcap  (không mạng, không capability)
+   └──────────────┘
+```
+
+### 2.1 Các service
+
+| Service | Image | Vai trò | Quyền |
+|---|---|---|---|
+| `idps` | `idps` | Cảm biến: kernel của nó chuyển tiếp gói giữa hai mạng (`net.ipv4.ip_forward=1`), Python chỉ **nghe** trên `int0` | root, `cap_drop: ALL` + `cap_add: NET_RAW` (mở AF_PACKET) |
+| `idps-offline` | `idps` (**cùng image** với `idps`) | Chế độ `--pcap`: chạy mọi test case trong `TEST/`, chạy `pytest` | UID/GID của user host, `cap_drop: ALL`, `network_mode: none` |
+| `attacker` | `idps-attacker` | Sinh traffic (`curl`, `dig`, `nc`), ghi PCAP tham chiếu (`tcpdump`) | `cap_drop: ALL` + `NET_ADMIN`, `NET_RAW`, `SETUID`, `SETGID` |
+| `victim` | `idps-victim` | Dịch vụ đích: nginx (`:80`, `:8081`), dnsmasq (`:53`, zone `victim.lab`), aiosmtpd (`:25`) | `cap_drop: ALL` + `NET_ADMIN`, `NET_BIND_SERVICE`, `CHOWN`, `SETUID`, `SETGID` |
+
+`idps` và `idps-offline` build từ **một image duy nhất**, tức chế độ live và chế độ PCAP chạy **cùng một
+mã nguồn** — điều kiện để test E2E ở `TEST/E2E-01_live-vs-pcap/` có nghĩa.
+
+### 2.2 Mạng và địa chỉ
+
+| Mạng | Subnet | Thành viên |
+|---|---|---|
+| `net_ext` | `10.10.0.0/24` | `attacker` `10.10.0.10` · `idps` `ext0` `10.10.0.254` |
+| `net_int` | `10.20.0.0/24` | `idps` `int0` `10.20.0.254` · `victim` `10.20.0.10` |
+
+IP khai cố định trong `compose.yaml` (không dùng IP động của Docker) để bằng chứng test lặp lại được.
+Tính chất "chỉ có một đường giữa hai mạng" **không** dựa vào `internal: true` — nó dựa vào việc
+`attacker` và `victim` mỗi bên chỉ có đúng một route sang mạng kia, trỏ vào cảm biến, và default route bị
+xoá lúc khởi động. Kiểm chứng: tắt `idps` thì `curl` từ attacker thất bại.
+
+### 2.3 Công nghệ và phiên bản
+
+| Thành phần | Chốt ở |
+|---|---|
+| `python:3.12.14-slim` (image cảm biến) | `Dockerfile` |
+| `scapy==2.7.0` — **chỉ** dùng để lấy bytes thô + nhãn thời gian (`recv_raw`, `RawPcapReader`); không dùng bộ bóc tách của nó | `requirements.txt` |
+| `pytest==9.1.1` | `requirements.txt` |
+| `debian:13-slim` (image `attacker`, `victim`) | `lab/attacker/Dockerfile`, `lab/victim/Dockerfile` |
+
+Mọi parser (Ethernet, IPv4, TCP, UDP, HTTP, DNS, SMTP) đều tự viết bằng `struct` và phép so sánh biên,
+không dùng thư viện bóc tách nào.
+
+### 2.4 Bố cục mã nguồn
+
+```
+main.py                 CLI: chọn nguồn, nối các tầng, in thống kê
+idps/capture/           live.py (AF_PACKET), pcap.py (đọc file PCAP)  ← nơi DUY NHẤT import Scapy
+idps/core/              frame.py, event.py, runner.py, sink.py, stats.py
+idps/decode/            ethernet.py → ipv4.py → tcp.py / udp.py → detector.py → http.py / dns.py / smtp.py
+                        pipeline.py (process_frame: một frame → một event), common.py (ParseResult, need)
+idps/output/jsonl.py    ghi JSON Lines, flush từng dòng
+tests/                  595 test; tests/tools/make_bad_pcaps.py sinh PCAP lỗi cho TC-11/TC-12
+TEST/                   bằng chứng test: mỗi thư mục con một test case
+```
+
+Một frame vào, **đúng một** dòng JSON ra — kể cả khi packet hỏng hay không nhận ra giao thức; lúc đó
+event mang `status` = `malformed`/`unknown` và danh sách `errors` chỉ rõ tầng nào phát hiện.
+
+### 2.5 Cách chạy
+
+```sh
+# UID/GID của host phải được export để file do idps-offline ghi ra thuộc về user host
+export HOST_UID=$(id -u) HOST_GID=$(id -g)
+
+docker compose build                          # dựng cả ba image
+docker compose up -d idps attacker victim     # chỉ cần khi muốn sinh traffic mới
+```
+
+Chế độ PCAP (không cần mạng, không cần quyền gì):
+
+```sh
+docker compose run --rm idps-offline python main.py --pcap <file.pcap> -o <out.jsonl>
+```
+
+Chế độ live trên cảm biến (`docker compose exec -T` **không** truyền tín hiệu vào container, nên PID
+được ghi ra file rồi gửi `SIGTERM` bằng một lệnh thứ hai — SIGTERM là đường dừng êm: đóng file, in thống
+kê, exit 0):
+
+```sh
+docker compose exec -T idps sh -c \
+    'python main.py --interface int0 -o /tmp/live.jsonl & echo $! > /tmp/live.pid; wait'
+# ... sinh traffic ở cửa sổ khác, rồi:
+docker compose exec -T idps sh -c 'kill -TERM $(cat /tmp/live.pid)'
+docker compose exec -T idps cat /tmp/live.jsonl > live.jsonl
+```
+
+Bộ test:
+
+```sh
+docker compose run --rm idps-offline python -m pytest -q      # 595 passed
+```
+
+### 2.6 Chạy lại một test case
+
+Mỗi thư mục con của `TEST/` có `input*.pcap` (đầu vào đã commit), `output*.jsonl` (kết quả đã commit),
+`run.log` và `README.md` mô tả kịch bản + cách tái hiện. Chạy lại một test case là chạy lại đúng file
+PCAP đó và so sánh — kết quả phải giống **từng byte**:
+
+```sh
+TC=TEST/TC-04_http-get
+docker compose run --rm idps-offline python main.py --pcap $TC/input.pcap -o $TC/output.jsonl
+git status --short $TC        # không in gì  →  output khớp từng byte với bản đã commit
+```
+
+Chạy lại **toàn bộ** bằng chứng (16 tệp output của 14 test case):
+
+```sh
+for f in TEST/*/input*.pcap; do
+    d=$(dirname "$f"); b=$(basename "$f" .pcap)
+    case "$d" in *E2E-01*) out="$d/pcap.jsonl";; *) out="$d/${b/input/output}.jsonl";; esac
+    docker compose run --rm idps-offline python main.py --pcap "$f" -o "$out" > /dev/null
+done
+git status --short TEST/       # rỗng  →  cả 16 tệp khớp từng byte
+```
+
+`live.jsonl` của `E2E-01` là ngoại lệ duy nhất không tái sinh được bằng lệnh trên: nó đến từ một lần bắt
+gói trực tiếp, nên nhãn thời gian và số hiệu cổng của lần chạy sau sẽ khác. Cách kiểm chứng nó nằm trong
+`TEST/E2E-01_live-vs-pcap/README.md`.
 
 ## 3. Chức năng dự kiến
 
@@ -67,7 +193,7 @@ và cập nhật trong suốt quá trình làm bài.
 
 | Tệp | Mức độ hỗ trợ của AI |
 |-----|----------------------|
-| `README.md` | Soạn thảo nội dung tài liệu có giám sát|
+| `README.md` | Soạn thảo nội dung tài liệu có giám sát. AI viết §2 (sơ đồ hai mạng, bảng service/quyền, bảng mạng–địa chỉ, bảng phiên bản, bố cục mã nguồn, các lệnh chạy và cách chạy lại một test case) từ `compose.yaml` + `Dockerfile` + `requirements.txt` đã chốt, và giải thích vì sao phải `export HOST_UID`, vì sao dừng live bằng PID + `kill -TERM`; tôi tự chạy lại từng lệnh trong §2.5–2.6 và tự kiểm bằng `git status` rằng 16 tệp output tái sinh khớp từng byte |
 | `Dockerfile` | AI viết bản đầu và giải thích từng dòng (base image, cache layer, biến môi trường); tôi đọc hiểu, build và kiểm tra |
 | `requirements.txt` | AI tra phiên bản mới nhất và viết dòng pin; tôi kiểm tra phiên bản trong image khớp pin |
 | `tests/test_layering.py` | AI viết bản đầu và giải thích cách dùng `ast` quét import (kể cả import tương đối); tôi đọc hiểu, chạy và thử chèn `import scapy` để thấy test fail |
