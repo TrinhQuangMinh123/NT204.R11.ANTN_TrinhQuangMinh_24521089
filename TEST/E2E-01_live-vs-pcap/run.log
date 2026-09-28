@@ -1,0 +1,5 @@
+live processed=42 unknown=0 malformed=0
+live exit=0
+pcap processed=42 unknown=0 malformed=0
+pcap exit=0
+diff lines=0
