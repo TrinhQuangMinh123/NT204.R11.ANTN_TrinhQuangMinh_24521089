@@ -370,14 +370,37 @@ def test_smtp_signature_does_not_steal_http_traffic_on_port_80():
         "HTTP", "port+payload")
 
 
-def test_a_body_fragment_starting_with_three_digits_is_the_known_risk_r5():
-    """Ca ngược của rủi ro R5, ghi lại để khỏi tưởng là bug: một mảnh body HTTP
-    mở đầu bằng "404 " KHÔNG còn chữ ký HTTP nào (đây là giữa luồng), nên chữ ký
-    reply SMTP khớp và event ghi SMTP với detect_method="payload". Chống được ca
-    này cần ghép luồng TCP (ngoài phạm vi, A2); điều bài này làm được là ghi rõ
-    kết luận dựa trên payload để người đọc log biết mà đối chiếu."""
-    assert http(sport=80, dport=40470, payload=b"404 page not found\n") == (
-        Detection("SMTP", "payload"))
+# --- T9.2b: chữ ký reply siết lại (R5, requirements v8) ---------------------
+
+def test_a_body_fragment_starting_with_three_digits_is_no_longer_smtp():
+    """Ca thúc đẩy T9.2b. Một mảnh body HTTP ở GIỮA luồng không còn chữ ký HTTP
+    nào (chữ ký chỉ có ở segment ĐẦU của response), nên trước đây chữ ký reply
+    4 byte khớp và event ghi SMTP trên một phiên port 80. Nay dòng thứ hai
+    (`<hr>nginx`) không khớp văn phạm reply → UNKNOWN."""
+    body = b"404 page not found\r\n<hr>nginx\r\n"
+    assert matches_smtp(body) is False
+    assert http(sport=80, dport=40470, payload=body) == Detection("UNKNOWN",
+                                                                 None)
+
+
+def test_a_pipelined_reply_batch_is_still_smtp():
+    """RFC 2920: server được gộp reply của nhiều lệnh vào một segment, mã KHÁC
+    nhau. Đây là lý do "mọi dòng cùng một mã" KHÔNG nằm trong chữ ký — đưa vào
+    sẽ bỏ sót traffic hợp lệ này (design ADR-5)."""
+    batch = b"250 OK\r\n250 OK\r\n550 no such user\r\n"
+    assert smtp(sport=SMTP_PORT, dport=40470, payload=batch) == Detection(
+        "SMTP", "port+payload")
+
+
+def test_a_single_line_fragment_is_the_residual_risk_r5():
+    """Phần R5 còn lại sau T9.2b, ghi lại để khỏi tưởng là bug: một dòng đơn
+    `404 page not found\r\n` về cú pháp ĐÚNG LÀ một reply hợp lệ, không chữ ký
+    không-trạng-thái nào phân biệt được. Chống được nó cần bảng flow (Suricata
+    cache `f->alproto`, nDPI `NDPI_EXCLUDE_PROTO`, Zeek gắn analyzer vào
+    connection) — ngoài A2. Điều bài này làm được: ghi `detect_method="payload"`
+    để người đọc log biết kết luận không có port chống lưng."""
+    result = http(sport=80, dport=40470, payload=b"404 page not found\r\n")
+    assert result == Detection("SMTP", "payload")
 
 
 def test_adding_smtp_did_not_change_http_or_dns_detection():

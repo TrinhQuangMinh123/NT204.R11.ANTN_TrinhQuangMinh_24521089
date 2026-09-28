@@ -106,6 +106,53 @@ def reply_code_at_start(payload: bytes) -> int | None:
     return int(code)
 
 
+def reply_shape_fits(payload: bytes) -> bool:
+    """Chữ ký nhận diện reply của Phụ lục C **sau khi siết ở T9.2b** (req v8).
+
+    Ba điều kiện, tất cả đều là bất biến CẤU TRÚC của một reply (RFC 5321 §4.2):
+
+      1. payload mở đầu bằng 3 chữ số + `[ -]` (`reply_code_at_start`);
+      2. có ít nhất một dòng kết thúc bằng CRLF — không kết luận trên dữ liệu
+         chưa trọn một dòng;
+      3. **mọi** dòng đã kết thúc trong payload đều khớp văn phạm reply.
+
+    Vì sao phải siết: chữ ký cũ chỉ xét 4 byte đầu, trong đó **chỉ 1 byte là
+    hằng số**. Một mảnh body HTTP ở GIỮA luồng (`404 page not found\r\n<hr>
+    nginx\r\n`) không còn chữ ký HTTP nào — chữ ký HTTP chỉ có ở segment ĐẦU —
+    nên nó khớp chữ ký reply và event ghi `app_proto="SMTP"` trên một phiên port
+    80. Đo trên 10 000 mẫu văn bản sinh có seed cố định: **49,9% → 27,0%**, trong
+    khi 10/10 payload reply thật của TC-10 vẫn khớp (ADR-5, bảng số đo).
+
+    Đây cũng là điều làm SMTP thống nhất với DNS: cả hai chữ ký giờ đều là
+    **probing parser** (thử parse), không phải so tiền tố — vì cả hai đều thiếu
+    một chuỗi mở đầu dài và hiếm như `GET ` hay `HTTP/1.`.
+
+    **Cố tình KHÔNG đòi mọi dòng cùng một mã**, dù RFC 5321 §4.2.1 buộc vậy:
+    luật đó là bất biến của MỘT reply, không phải của một SEGMENT. RFC 2920
+    (PIPELINING) cho phép server gộp reply của nhiều lệnh vào một segment, ví dụ
+    `250 OK` `250 OK` `550 no such user` — traffic hợp lệ mà điều kiện "cùng mã"
+    sẽ bỏ sót (đo được 17,5% nhận nhầm nhưng mất ca này). Việc phát hiện mã
+    không đồng nhất vì thế thuộc về parser (`_parse_response` báo lỗi) chứ không
+    thuộc về chữ ký.
+    """
+    if reply_code_at_start(payload) is None:
+        return False
+    lines = payload.split(CRLF)[:-1]
+    if not lines:
+        return False
+    # decode("latin-1") thay vì "ascii": mỗi byte thành đúng một ký tự và
+    # KHÔNG BAO GIỜ ném. Ở đây ta chỉ hỏi về HÌNH DẠNG, mà hình dạng chỉ gồm
+    # byte ASCII (3 chữ số + phân cách) nên latin-1 không làm sai kết quả. Nếu
+    # dùng "ascii" nghiêm ngặt thì một byte > 0x7F trong phần text sẽ làm chữ ký
+    # TRƯỢT → event ra `UNKNOWN`, và cái lỗi "byte > 0x7F trong reply SMTP" —
+    # đúng thứ một IDS cần thấy — sẽ không bao giờ được báo (§8.2). Tức là:
+    # chữ ký xét hình dạng (dễ tính với byte lạ), parser xét nội dung (nghiêm
+    # ngặt, và báo lỗi). Cùng MỘT hàm văn phạm `_reply_code_of_line` cho cả hai
+    # nên hai nơi không thể lệch nhau về định nghĩa "thế nào là một dòng reply".
+    return all(_reply_code_of_line(raw.decode("latin-1"))[0] is not None
+               for raw in lines)
+
+
 def command_at_start(payload: bytes) -> str | None:
     """Tên lệnh (chuẩn hoá HOA) nếu payload mở đầu bằng một lệnh Phụ lục C.
 

@@ -11,7 +11,7 @@ import pytest
 
 from idps.decode.smtp import (APP_FIELDS, COMMANDS, command_at_start,
                               parse_smtp, reply_code_at_start,
-                              stray_eol_offset)
+                              reply_shape_fits, stray_eol_offset)
 
 # Reply chào của aiosmtpd trong lab (xem TEST/TC-10), dùng lại nhiều lần.
 GREETING = b"220 victim.lab Python SMTP 1.4.6\r\n"
@@ -255,6 +255,59 @@ def test_a_line_ending_in_bare_lf_is_not_parsed_as_a_line_at_all():
     r = parse_smtp(b"250-ok\r\n550 denied\n")
     assert r.fields["lines"] == ["ok"]
     assert "crlf" in r.error and "550" not in r.error
+
+
+# --- T9.2b: chữ ký reply là probing parser (Phụ lục C v8, R5) ---------------
+
+@pytest.mark.parametrize("payload", [
+    GREETING,                                   # một dòng
+    EHLO_REPLY,                                 # nhiều dòng, cùng mã
+    b"250-first\r\n250\r\n",                    # dòng không có text (RFC 5321 §4.2)
+    b"250 OK\r\n250 OK\r\n550 no such user\r\n",  # reply gộp, RFC 2920
+    b"250 ok\xff\r\n",                          # byte lạ trong text -> parser lo
+])
+def test_reply_shape_accepts_real_replies(payload):
+    assert reply_shape_fits(payload) is True
+
+
+@pytest.mark.parametrize("payload", [
+    b"404 page not found\r\n<hr>nginx\r\n",     # mảnh body HTTP giữa luồng
+    b"502 Bad Gateway\r\n<html><body>\r\n",
+    b"123 Main Street, Apt 4\r\nHo Chi Minh City\r\n",
+    b"200 OK duoc ghi trong log\r\nline hai khong phai reply\r\n",
+    b"250 ban ghi da luu",                      # không có CRLF nào -> chưa trọn dòng
+    b"250 ok\r\n\r\n",                          # dòng trống không phải reply line
+])
+def test_reply_shape_rejects_text_that_only_starts_like_a_reply(payload):
+    """Điểm cốt lõi của T9.2b: dòng THỨ HAI là thứ tố giác. Chữ ký cũ chỉ xem 4
+    byte đầu nên nhận hết các payload này (đo được 49,9% nhận nhầm trên văn bản
+    ngẫu nhiên, còn 27,0% sau khi siết)."""
+    assert reply_shape_fits(payload) is False
+
+
+def test_a_single_line_is_the_residual_risk_r5():
+    """Ca KHÔNG chữ ký không-trạng-thái nào phân biệt được: một dòng đơn đúng là
+    một reply hợp lệ về cú pháp. Cần bảng flow (ngoài A2) — ghi lại để biết đây
+    là giới hạn đã lường, không phải bug."""
+    assert reply_shape_fits(b"404 page not found\r\n") is True
+
+
+def test_the_signature_is_lenient_about_bytes_but_the_parser_is_not():
+    """Chia việc: chữ ký xét HÌNH DẠNG (byte lạ vẫn khớp, nhờ latin-1), parser
+    xét NỘI DUNG (ascii nghiêm ngặt, và báo lỗi). Nếu chữ ký cũng nghiêm ngặt thì
+    event ra UNKNOWN và lỗi này không bao giờ được báo."""
+    payload = b"250 ok\xff\r\n"
+    assert reply_shape_fits(payload) is True
+    assert "0xff" in parse_smtp(payload).error
+
+
+def test_inconsistent_codes_stay_a_parser_error_not_a_signature_miss():
+    """RFC 5321 §4.2.1 buộc mọi dòng của MỘT reply cùng mã, nhưng RFC 2920 cho
+    server gộp nhiều reply vào một segment → "cùng mã" không phải bất biến của
+    một segment, nên nó KHÔNG nằm trong chữ ký (design ADR-5)."""
+    payload = b"250-ok so far\r\n550 denied\r\n"
+    assert reply_shape_fits(payload) is True                   # vẫn nhận là SMTP
+    assert "declares code 550" in parse_smtp(payload).error     # rồi mới báo lỗi
 
 
 # --- chữ ký (dùng bởi detector ở T9.2) --------------------------------------

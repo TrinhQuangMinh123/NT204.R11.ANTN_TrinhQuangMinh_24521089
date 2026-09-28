@@ -26,7 +26,7 @@ from typing import Callable
 from .common import ParseResult
 from .dns import parse_dns, question_section_fits
 from .http import parse_http
-from .smtp import command_at_start, parse_smtp, reply_code_at_start
+from .smtp import command_at_start, parse_smtp, reply_shape_fits
 
 
 @dataclass(frozen=True)
@@ -119,16 +119,24 @@ def matches_smtp(payload: bytes) -> bool:
     được `parse_smtp` dùng lại y nguyên, nên KHÔNG có cách nào để chữ ký nhận
     diện và parser lệch nhau về định nghĩa "thế nào là một lệnh".
 
-    Rủi ro R5 phải nhận: chữ ký reply chỉ là "3 chữ số + dấu cách hoặc `-`", mà
-    một segment TCP bất kỳ có xác suất không nhỏ mở đầu như thế (vd một mảnh
-    body HTTP bắt đầu bằng "404 "). Ba thứ giữ rủi ro đó ở mức chấp nhận được:
-    (1) port chuẩn được thử TRƯỚC, nên trên :80 thì HTTP luôn được xét trước;
-    (2) `detect_method` ghi lại "payload", nên người đọc log biết kết luận này
-    KHÔNG có port chống lưng; (3) event vẫn giữ nguyên `payload_b64` để soi lại.
-    Thu hẹp thành "chữ số đầu phải 2..5" sẽ giảm rủi ro nhưng khác Phụ lục C
-    (đã chốt) → là một thay đổi đặc tả, không phải một sửa code.
+    Rủi ro R5 và cách xử lý (T9.2b, requirements v8): chữ ký reply từng chỉ xét
+    4 byte đầu, trong đó chỉ 1 byte là hằng số — quá ngắn, nên một mảnh body HTTP
+    ở giữa luồng (`404 page not found…`) cũng khớp và bị gán SMTP trên port 80.
+    Nay nó là **probing parser** (`reply_shape_fits`): mọi dòng đã kết thúc trong
+    payload đều phải khớp văn phạm reply. Đo được 49,9% → 27,0% nhận nhầm trên
+    10 000 mẫu văn bản ngẫu nhiên, và 10/10 reply thật của TC-10 vẫn khớp.
+
+    Phần 27,0% còn lại KHÔNG xử lý được ở bài 1: một dòng đơn `404 page not
+    found\r\n` về cú pháp **đúng là** một reply hợp lệ. Muốn phân biệt phải biết
+    đây là *giữa* một luồng đã nhận là HTTP — tức cần bảng flow, đúng cách
+    Suricata (cache `f->alproto` sau khi nhận diện trên data đầu tiên của mỗi
+    chiều), nDPI (`NDPI_EXCLUDE_PROTO`) và Zeek (analyzer gắn vào connection)
+    làm. A2 loại việc ghép luồng khỏi bài 1. Ba thứ vẫn giữ rủi ro ở mức đọc
+    được: (1) port chuẩn thử TRƯỚC nên trên :80 HTTP luôn được xét trước;
+    (2) `detect_method="payload"` nói rõ kết luận KHÔNG có port chống lưng;
+    (3) `payload_b64` còn nguyên để soi lại.
     """
-    return (reply_code_at_start(payload) is not None
+    return (reply_shape_fits(payload)
             or command_at_start(payload) is not None)
 
 
