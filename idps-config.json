@@ -1,0 +1,10 @@
+{
+  "_comment": "Tham so runtime bai 2 (Phu luc J). Ghi de tung tham so khi chay: --set tcp.new=5. Khoa bat dau bang '_' duoc bo qua.",
+  "tcp": {"new": 60, "established": 3600, "closed": 120},
+  "udp": {"new": 30, "established": 300},
+  "max_active_flows": 10000,
+  "max_decode_bytes": 65536,
+  "max_reassembly_bytes": 1048576,
+  "max_reassembly_total_bytes": 16777216,
+  "missing_data_policy": "mark"
+}
