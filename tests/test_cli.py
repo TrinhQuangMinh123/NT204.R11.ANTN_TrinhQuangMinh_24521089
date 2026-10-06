@@ -203,7 +203,11 @@ def test_stats_line(tmp_path):
     out = tmp_path / "out.jsonl"
     result = run_cli("--pcap", src, "-o", out)
     assert result.returncode == 0
-    assert result.stdout.strip() == "processed=3 unknown=1 malformed=1"
+    # Bài 2 thêm một dòng config trước packet đầu tiên (REQ-36.4); dòng thống kê
+    # của bài 1 vẫn là dòng cuối, giữ nguyên từng ký tự (design §5.5).
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("config=")
+    assert lines[-1] == "processed=3 unknown=1 malformed=1"
 
 
 def test_one_line_per_packet(tmp_path):
@@ -249,7 +253,9 @@ def test_truncated_record_does_not_stop_the_run(tmp_path):
     events = [json.loads(line) for line in lines_of(out)]
     assert len(events) == 2
     assert events[1]["errors"] == [{"layer": "capture", "reason": "truncated record"}]
-    assert result.stdout.strip() == "processed=2 unknown=0 malformed=1"
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("config=")          # config echo (REQ-36.4)
+    assert lines[-1] == "processed=2 unknown=0 malformed=1"
 
 
 def test_stats_line_matches_the_file(tmp_path):

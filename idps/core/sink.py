@@ -16,6 +16,12 @@ class EventSink:
     Dùng lớp cơ sở chứ không chỉ "quy ước có hai method" để chỗ gắn module là
     một cái tên tra được trong mã nguồn, và để mọi sink thừa hưởng close()
     rỗng — phần lớn module phía sau (vd bộ đếm) không có tài nguyên để đóng.
+
+    Hợp đồng là "sink nhận một dict của MỘT schema" — không nhất thiết là event.
+    Bài 2 dùng lại chính JsonlWriter cho flow record (ADR-25): nó chỉ biến một
+    dict thành một dòng JSON, không đọc khoá nào của event. Vì vậy `flows.jsonl`
+    chứa flow record, KHÔNG chứa event — hai tệp hai schema khác nhau, và flow
+    sink KHÔNG nằm trong danh sách `sinks` của Runner (vòng đời thuộc FlowTracker).
     """
 
     def handle(self, event: dict) -> None:
