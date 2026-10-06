@@ -77,3 +77,24 @@ def test_core_is_independent():
         if is_under(name, "idps.decode") or is_under(name, "idps.output")
     ]
     assert bad == [], "idps/core/ không được phụ thuộc decode/output"
+
+
+def test_process_is_independent():
+    """I-20/NFR-16: idps/process/ chỉ được phụ thuộc idps/core/.
+
+    Ba module bài 2 (Decoder, Preprocessor, FlowTracker) chỉ đọc event trong
+    bộ nhớ, nên KHÔNG được import scapy, idps.capture hay idps.decode. Giữ
+    chiều phụ thuộc một chiều `process -> core` chính là cách bảo đảm object
+    của thư viện (Scapy) không lọt sang tầng xử lý (đề bài §6): một frame của
+    Scapy không có đường nào bám tới đây vì tầng này không biết tới capture.
+    Quét bằng ast như I-9 nên chữ "import scapy" trong docstring không bị tính.
+    """
+    forbidden = ("scapy", "idps.capture", "idps.decode")
+    bad = [
+        f"{p.relative_to(ROOT)}: {name}"
+        for p in source_files()
+        if is_in(p, "process")
+        for name in imported_modules(p)
+        if any(is_under(name, prefix) for prefix in forbidden)
+    ]
+    assert bad == [], "idps/process/ chỉ được phụ thuộc idps/core/"
