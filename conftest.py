@@ -9,13 +9,15 @@
 """
 import pytest
 
-# Chép tay từ design §5.4 — CỐ TÌNH không import từ idps.core.event, để test
-# còn phát hiện được khi ai đó đổi thứ tự hay thêm/bớt khoá trong mã nguồn.
+# Chép tay từ design §5.4 (bài 1) + §5.2 (bài 2) — CỐ TÌNH không import từ
+# idps.core.event, để test còn phát hiện được khi ai đó đổi thứ tự hay thêm/bớt
+# khoá trong mã nguồn. Ba khoá cuối là schema v2 của bài 2 (ADR-19).
 EVENT_KEYS = (
     "schema_version", "packet_id", "timestamp", "source", "cap_len", "wire_len",
     "linktype", "link_proto", "network_proto", "src_ip", "dst_ip",
     "transport_proto", "src_port", "dst_port", "app_proto", "detect_method",
     "status", "errors", "ethernet", "ipv4", "tcp", "udp", "app",
+    "decode", "preprocess", "flow",
 )
 
 

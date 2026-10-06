@@ -84,7 +84,7 @@ def test_compact_separators(tmp_path):
     writer = JsonlWriter(out)
     writer.handle(make_event(1))
     writer.close()
-    assert lines_of(out)[0].startswith('{"schema_version":1,"packet_id":1,')
+    assert lines_of(out)[0].startswith('{"schema_version":2,"packet_id":1,')
 
 
 # --- chống vỡ dòng (I-3) -----------------------------------------------------

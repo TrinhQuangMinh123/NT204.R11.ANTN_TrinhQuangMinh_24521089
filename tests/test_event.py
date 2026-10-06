@@ -55,8 +55,60 @@ def test_skeleton_starts_empty():
 
 
 def test_schema_version():
-    assert SCHEMA_VERSION == 1
-    assert new_event(make_frame(), 1)["schema_version"] == 1
+    assert SCHEMA_VERSION == 2
+    assert new_event(make_frame(), 1)["schema_version"] == 2
+
+
+# --- schema v2: ba khoá mới của bài 2 (I-12, NFR-17, §5.2) ------------------
+
+EMPTY_DECODED = {"value": None, "rule": None, "status": "not_applicable", "reasons": []}
+
+
+def test_schema_v2_keys():
+    """Ba khoá cấp cao của bài 2 có mặt, đúng thứ tự, với khung con đầy đủ.
+
+    Dựng rỗng ngay trong new_event() (không do từng stage tự thêm) là bất biến
+    I-12: một event bị chặn giữa chuỗi stage vẫn đủ ba khoá này. Năm mục của
+    `decode` là DecodedValue rỗng — bốn khoá luôn có mặt (NFR-17, §5.1).
+    """
+    e = new_event(make_frame(), 1)
+    assert tuple(e)[-3:] == ("decode", "preprocess", "flow")
+
+    assert tuple(e["decode"]) == (
+        "status", "reasons", "uri", "query", "body_form", "body_text", "mime",
+    )
+    assert e["decode"]["status"] == "not_applicable"
+    assert e["decode"]["reasons"] == []
+    for field in ("uri", "query", "body_form", "body_text", "mime"):
+        assert e["decode"][field] == EMPTY_DECODED
+
+    assert tuple(e["preprocess"]) == (
+        "status", "action", "reasons", "transport_proto", "app_proto",
+        "src_ip", "dst_ip", "dns_names", "http_host", "http_header_names",
+        "path", "query_string", "ts_usec",
+    )
+    assert e["preprocess"]["status"] is None
+    assert e["preprocess"]["action"] is None
+    assert e["preprocess"]["reasons"] == []
+    assert e["preprocess"]["dns_names"] == []
+    assert e["preprocess"]["http_header_names"] == []
+
+    assert tuple(e["flow"]) == ("flow_id", "direction", "state", "reasons")
+    assert e["flow"]["flow_id"] is None
+    assert e["flow"]["state"] is None
+    assert e["flow"]["reasons"] == []
+
+
+def test_v2_keys_are_not_shared_between_events():
+    """Mỗi event có list `reasons` RIÊNG — không alias giữa hai event (I-1)."""
+    a = new_event(make_frame(), 1)
+    b = new_event(make_frame(), 2)
+    a["decode"]["uri"]["reasons"].append("x")
+    a["preprocess"]["reasons"].append("y")
+    a["flow"]["reasons"].append("z")
+    assert b["decode"]["uri"]["reasons"] == []
+    assert b["preprocess"]["reasons"] == []
+    assert b["flow"]["reasons"] == []
 
 
 # --- JSON (I-3) -------------------------------------------------------------

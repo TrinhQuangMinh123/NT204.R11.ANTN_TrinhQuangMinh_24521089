@@ -9,7 +9,12 @@ from datetime import datetime, timedelta, timezone
 
 # Tăng khi một khoá bị đổi tên, đổi kiểu hoặc bị xoá (REQ-12.6). Module bài sau
 # đọc khoá này trước để biết mình có hiểu được dòng JSON hay không.
-SCHEMA_VERSION = 1
+#
+# v1 -> v2 (bài 2, C-23/REQ-39.3, ADR-19): THÊM ba khoá cấp cao `decode`,
+# `preprocess`, `flow` ở cuối event; KHÔNG khoá nào của bài 1 bị đổi tên, đổi
+# kiểu hay xoá. Thêm khoá vẫn phải tăng mốc này, vì một dòng v1 và một dòng v2
+# có tập khoá khác nhau — module đọc lại phải biết nó đang đọc schema nào.
+SCHEMA_VERSION = 2
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _USEC_PER_SEC = 1_000_000
@@ -47,13 +52,29 @@ def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _empty_decoded() -> dict:
+    """`DecodedValue` rỗng — hình dạng dùng lại cho mọi kết quả giải mã (§5.1).
+
+    Bốn khoá LUÔN có mặt kể cả khi chưa decode gì (REQ-25.3, NFR-17), để module
+    phía sau đọc `e["decode"]["uri"]["value"]` được mà không phải .get(). Là một
+    hàm (không phải hằng dùng chung) để MỖI event có list `reasons` riêng — dùng
+    chung một list sẽ làm event này thấy lý do của event kia. `not_applicable` là
+    giá trị đúng cho "chưa áp dụng phép decode nào", xếp cuối thang nghiêm trọng.
+    """
+    return {"value": None, "rule": None, "status": "not_applicable", "reasons": []}
+
+
 def new_event(frame, packet_id: int) -> dict:
-    """Khung event đủ khoá, đúng thứ tự §5.4 — các tầng chỉ ĐIỀN, không THÊM.
+    """Khung event đủ khoá, đúng thứ tự §5.4 (+ §5.2 bài 2) — tầng chỉ ĐIỀN, không THÊM.
 
     Dựng đủ khoá ngay từ đầu là cách bảo đảm I-2: một packet dừng ở tầng link
     và một packet đi hết tới HTTP vẫn ra cùng tập khoá, nên module phía sau
     đọc e["tcp"] được mà không cần .get(). dict của Python giữ thứ tự chèn,
     nên thứ tự khoá trong file JSON chính là thứ tự viết dưới đây (NFR-2).
+
+    Ba khoá cuối (`decode`, `preprocess`, `flow`) là của bài 2 (schema v2,
+    ADR-19): dựng rỗng SẴN ở đây để một event bị chặn giữa chuỗi stage vẫn đủ
+    khoá (I-12). Chúng là literal, không import gì, nên core/ vẫn độc lập (I-9).
     """
     return {
         "schema_version": SCHEMA_VERSION,
@@ -81,6 +102,44 @@ def new_event(frame, packet_id: int) -> dict:
         "tcp": None,
         "udp": None,
         "app": None,
+        # --- schema v2 (bài 2) — ba khoá dưới đây tầng process/ ĐIỀN, §5.2 ---
+        # Decoder điền. `status` là tổng hợp của năm DecodedValue dưới nó theo
+        # thang nghiêm trọng §5.1; rỗng = mọi mục not_applicable -> not_applicable.
+        "decode": {
+            "status": "not_applicable",
+            "reasons": [],
+            "uri": _empty_decoded(),
+            "query": _empty_decoded(),
+            "body_form": _empty_decoded(),
+            "body_text": _empty_decoded(),
+            "mime": _empty_decoded(),
+        },
+        # Preprocessor điền. `status`/`action` = None nghĩa là "chưa chạy
+        # Preprocessor" (vd chuỗi stage dừng trước nó); khi chạy nó đặt giá trị
+        # thuộc tập Phụ lục H. Mọi trường chuẩn hoá là THÊM, không ghi đè bài 1.
+        "preprocess": {
+            "status": None,
+            "action": None,
+            "reasons": [],
+            "transport_proto": None,
+            "app_proto": None,
+            "src_ip": None,
+            "dst_ip": None,
+            "dns_names": [],
+            "http_host": None,
+            "http_header_names": [],
+            "path": None,
+            "query_string": None,
+            "ts_usec": None,
+        },
+        # FlowTracker điền. `flow_id` = None khi không đủ 5-tuple hoặc event bị
+        # chặn trước Flow Tracker; `state` là trạng thái SAU khi tính packet này.
+        "flow": {
+            "flow_id": None,
+            "direction": None,
+            "state": None,
+            "reasons": [],
+        },
     }
 
 
