@@ -20,6 +20,7 @@ from idps.decode.pipeline import process_frame
 from idps.output.jsonl import JsonlWriter
 from idps.process.chain import ProcessingChain
 from idps.process.config import Config, ConfigError
+from idps.process.decoder import Decoder
 
 PROG = "main.py"
 DEFAULT_OUTPUT = "events.jsonl"
@@ -74,15 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_sinks(args) -> list:
+def build_sinks(args, config) -> list:
     """Các module phía sau của lần chạy này, theo thứ tự nhận event (REQ-20.1).
 
     Bài 2: chuỗi stage (Decoder → Preprocessor → FlowTracker) gói trong MỘT
     `ProcessingChain` đứng TRƯỚC bộ ghi event, nên event chỉ được ghi SAU khi đã
-    đi qua ba stage (ADR-17). Phase 0 để chuỗi RỖNG — event đi qua không đổi;
-    các phase sau nối stage vào đây. Runner, JsonlWriter của bài 1 không đổi.
+    đi qua các stage (ADR-17). Phase 1 có Decoder; Preprocessor và FlowTracker
+    nối vào đúng danh sách này ở phase sau. Runner, JsonlWriter của bài 1 không đổi.
     """
-    return [ProcessingChain([]), JsonlWriter(args.output)]
+    return [ProcessingChain([Decoder(config)]), JsonlWriter(args.output)]
 
 
 def build_flow_sinks(args) -> list:
@@ -210,7 +211,7 @@ def main(argv=None) -> int:
     # phút rồi mới phát hiện không ghi được file là mất trắng. Bắt Exception chứ
     # không chỉ OSError vì module bài sau có thể mở tài nguyên khác.
     try:
-        sinks = build_sinks(args)
+        sinks = build_sinks(args, config)
     except Exception as exc:  # noqa: BLE001 - lỗi khởi động của module phía sau
         return fail(f"cannot open output: {exc}")
     try:
