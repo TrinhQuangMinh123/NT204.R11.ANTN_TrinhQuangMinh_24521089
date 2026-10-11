@@ -3,7 +3,13 @@
 Mỗi ca đã đo ở ADR-20/ADR-21 là một test trực tiếp (chiến lược §9). entity_decode
 và mime_decode có test riêng ở T1.2/T1.3.
 """
-from idps.process.codecs import decoded, form_decode, percent_decode, to_text
+from idps.process.codecs import (
+    decoded,
+    entity_decode,
+    form_decode,
+    percent_decode,
+    to_text,
+)
 
 LIMIT = 65536  # max_decode_bytes mặc định
 
@@ -108,3 +114,50 @@ def test_to_text_invalid_byte_is_partial():
 def test_to_text_does_not_raise_on_any_bytes():
     for data in (b"", b"\x00", bytes(range(256))):
         to_text(data)  # không ném
+
+
+# --- entity_decode (F4/F5) — REQ-22, ADR-27 --------------------------------
+
+def test_entity_decode_once():
+    dv = entity_decode("&amp;lt;")
+    assert dv["value"] == "&lt;"        # một lần: &amp;->& , KHÔNG giải tiếp ra <
+    assert dv["status"] == "ok"
+
+
+def test_entity_decode_well_formed_is_ok():
+    dv = entity_decode("&lt;script&gt;")
+    assert dv["value"] == "<script>"
+    assert dv["status"] == "ok"
+
+
+def test_entity_missing_semicolon_is_decoded_and_partial():
+    dv = entity_decode("&ltscript&gt")           # thiếu `;`, khớp luật HTML5
+    assert dv["value"] == "<script>"
+    assert dv["status"] == "partial"
+    assert dv["reasons"]
+
+
+def test_entity_longest_match_leaves_remainder():
+    dv = entity_decode("&notit;")                # &not -> ¬, còn 'it;'
+    assert dv["value"] == "¬it;"
+    assert dv["status"] == "partial"
+
+
+def test_entity_unknown_name_kept_verbatim():
+    dv = entity_decode("&bogus;")
+    assert dv["value"] == "&bogus;"              # giữ nguyên (REQ-22.5)
+    assert dv["status"] == "partial"
+    assert dv["reasons"]
+
+
+def test_entity_numeric_forms():
+    dv = entity_decode("&#60;&#x3E;")
+    assert dv["value"] == "<>"
+    assert dv["status"] == "ok"
+
+
+def test_entity_plain_ampersand_not_flagged():
+    for text in ("Tom & Jerry", "AT&T", "a=1&b=2"):
+        dv = entity_decode(text)
+        assert dv["status"] == "ok", text
+        assert dv["reasons"] == []

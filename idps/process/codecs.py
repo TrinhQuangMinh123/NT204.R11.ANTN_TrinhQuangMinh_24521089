@@ -14,9 +14,19 @@ kiến là dữ liệu, trả qua `status`/`reasons` (ADR-4 của bài 1).
 Lưu ý tên tệp: đây là `idps.process.codecs`, KHÔNG che `codecs` của thư viện
 chuẩn — Python 3 dùng absolute import nên `import codecs` ở nơi khác vẫn ra stdlib.
 """
+import html
+import html.entities
+import re
 import urllib.parse
 
 _HEX = set("0123456789abcdefABCDEF")
+
+# Một tham chiếu entity: &#NNN · &#xHH (số) · &name (chữ), tuỳ chọn kết thúc `;`.
+_ENTITY_REF = re.compile(r"&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*)(;?)")
+# Bảng tra entity HTML5 của thư viện chuẩn: khoá có `;` ('lt;') và khoá KHÔNG `;`
+# ('lt') — tập không `;` chính là các entity hợp lệ thiếu `;` của HTML5. Dùng để
+# DÒ (html.unescape mới là chỗ giải mã — ADR-27).
+_HTML5 = html.entities.html5
 
 
 def decoded(value, rule, status, reasons=None):
@@ -114,3 +124,40 @@ def form_decode(value, limit):
     pairs = urllib.parse.parse_qsl(value, keep_blank_values=True)
     status = "partial" if bad is not None else "ok"
     return decoded([[name, val] for name, val in pairs], None, status, reasons)
+
+
+def _has_known_entity_prefix(body):
+    """body (chữ, không `;`) có tiền tố nào là entity hợp lệ KHÔNG `;` của HTML5?
+
+    Mô phỏng ở mức DÒ luật khớp dài nhất của HTML5 (`&ltscript` khớp `&lt`): nếu
+    có thì html.unescape SẼ giải mã đoạn đó mà thiếu `;` -> ca bất thường REQ-22.6.
+    """
+    return any(body[:k] in _HTML5 for k in range(len(body), 0, -1))
+
+
+def entity_decode(value):
+    """Giải HTML entity MỘT lần bằng html.unescape (F4/F5), tự dò ca bất thường.
+
+    `&amp;lt;` → `&lt;` chứ không `<` (I-14, REQ-22.4): html.unescape chạy một pass,
+    không giải lại kết quả. Entity thiếu `;` mà khớp luật HTML5 vẫn được giải
+    (REQ-22.6, ADR-27) — IDS phải thấy dữ liệu ở dạng trình duyệt thấy, nếu không
+    `&ltscript&gt` qua mặt luật phát hiện. Entity tên lạ giữ nguyên nguyên văn
+    (REQ-22.5). Hai ca bất thường → `partial` kèm lý do; giá trị gốc do nơi gọi
+    giữ (REQ-22.2). Không ném.
+
+    Chỉ đánh dấu `partial` khi có DẤU HIỆU entity (có `;`, hoặc thiếu `;` nhưng
+    khớp bảng tra). `&` trần trong text thường ("AT&T") KHÔNG bị đánh dấu — tránh
+    cảnh báo sai tràn lan, trong khi vẫn giữ chiều "thà sai hơn sót" của ADR-27.
+    """
+    reasons = []
+    for match in _ENTITY_REF.finditer(value):
+        body, semicolon = match.group(1), match.group(2)
+        numeric = body.startswith("#")
+        if semicolon:
+            if numeric or (body + ";") in _HTML5:
+                continue                                 # &#60; / &lt; — hợp lệ
+            reasons.append(f"unknown_entity_at={match.start()}")        # REQ-22.5
+        elif numeric or _has_known_entity_prefix(body):
+            reasons.append(f"entity_without_semicolon_at={match.start()}")  # REQ-22.6
+    status = "partial" if reasons else "ok"
+    return decoded(html.unescape(value), None, status, reasons)
