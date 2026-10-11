@@ -2,7 +2,7 @@
 
 Normalization (T2.2) và policy/gate (T2.3) thêm test ở commit sau.
 """
-from idps.core.event import new_event
+from idps.core.event import format_timestamp, new_event
 from idps.core.frame import RawFrame
 from idps.process.config import Config
 from idps.process.preprocessor import Preprocessor
@@ -110,3 +110,80 @@ def test_upstream_malformed_is_partial():
     pp = run(base_event(status="malformed"))
     assert pp["status"] == "partial"
     assert any("malformed" in r for r in pp["reasons"])
+
+
+# --- T2.2 chuẩn hoá (REQ-27, Phụ lục G.5) ----------------------------------
+
+def http_event(uri="/", headers=None):
+    event = base_event(app_proto="HTTP")
+    event["app"] = {
+        "kind": "request", "method": "GET", "uri": uri, "version": "HTTP/1.1",
+        "status_code": None, "reason": None, "headers": headers or [],
+        "body_len": 0, "body_b64": "", "incomplete": False,
+    }
+    return event
+
+
+def test_ip_leading_zeros_stripped():
+    pp = run(base_event(src_ip="010.020.000.010", dst_ip="10.20.0.10"))
+    assert pp["src_ip"] == "10.20.0.10"
+    assert pp["dst_ip"] == "10.20.0.10"
+
+
+def test_protocol_uppercased():
+    event = base_event(transport_proto="TCP", app_proto="HTTP")
+    pp = run(event)
+    assert pp["transport_proto"] == "TCP" and pp["app_proto"] == "HTTP"
+
+
+def test_header_names_lowercased_same_count_and_order():
+    event = http_event(headers=[["Host", "a"], ["Content-Type", "x"], ["host", "b"]])
+    pp = run(event)
+    assert pp["http_header_names"] == ["host", "content-type", "host"]
+    # app.headers gốc KHÔNG đổi; tra theo chỉ số ra đúng tên gốc.
+    assert event["app"]["headers"][0][0] == "Host"
+    assert event["app"]["headers"][2][0] == "host"
+    assert len(pp["http_header_names"]) == len(event["app"]["headers"])
+
+
+def test_http_host_normalized_as_domain():
+    pp = run(http_event(headers=[["Host", "Example.COM."]]))
+    assert pp["http_host"] == "example.com"
+
+
+def test_path_normalized_and_query_split():
+    pp = run(http_event(uri="//a/./b/../c?q=1"))
+    assert pp["path"] == "/a/c"
+    assert pp["query_string"] == "q=1"
+
+
+def test_original_uri_is_not_overwritten():
+    event = http_event(uri="//a/./b/../c?q=1")
+    run(event)
+    assert event["app"]["uri"] == "//a/./b/../c?q=1"   # REQ-27.8
+
+
+def test_path_traversal_above_root_stops_and_marks_partial():
+    pp = run(http_event(uri="/../etc"))
+    assert pp["status"] == "partial"
+    assert any("path_traversal" in r for r in pp["reasons"])
+
+
+def test_dns_names_lowercased_question_then_answer():
+    event = base_event(app_proto="DNS")
+    event["app"] = {
+        "id": 1, "qr": "response", "opcode": "QUERY", "rcode": "NOERROR",
+        "qdcount": 1, "ancount": 1,
+        "questions": [{"name": "WWW.Example.COM.", "type": "A"}],
+        "answers": [{"name": "WWW.Example.COM.", "type": "A", "ttl": 60, "data": "1.2.3.4"}],
+    }
+    pp = run(event)
+    assert pp["dns_names"] == ["www.example.com", "www.example.com"]
+
+
+def test_ts_usec_matches_timestamp_string():
+    event = base_event(timestamp="2026-09-27T05:22:03.123456Z")
+    pp = run(event)
+    usec = pp["ts_usec"]
+    assert isinstance(usec, int)
+    assert format_timestamp(usec // 1_000_000, usec % 1_000_000) == "2026-09-27T05:22:03.123456Z"

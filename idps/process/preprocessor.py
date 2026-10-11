@@ -11,8 +11,11 @@ Flow Tracker chỉ nên nhận event có dữ liệu dùng được, nên stage 
 Chỉ import idps.core và idps.process — tầng process/ độc lập với capture/decode (I-20).
 """
 import re
+from datetime import datetime, timezone
 
 from .chain import Stage
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # timestamp hợp lệ: YYYY-MM-DDTHH:MM:SS.ffffffZ (G.4, bài 1 Q10/ADR-7).
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
@@ -88,8 +91,114 @@ def _soft_reasons(event):
     return reasons
 
 
+# --- chuẩn hoá (REQ-27, Phụ lục G.5) — luôn THÊM trường, không ghi đè (C-21) --
+
+def _normalize_ipv4(ip):
+    """Bỏ số 0 vô nghĩa đứng đầu mỗi octet: `010.020.000.010` → `10.20.0.10`.
+
+    Không phải dotted-quad hợp lệ (IPv6, rác) → giữ nguyên: chuẩn hoá là bước AN
+    TOÀN, không được đổi ý nghĩa dữ liệu không hiểu được (C-21).
+    """
+    parts = ip.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        octets = [int(p) for p in parts]
+        if all(0 <= o <= 255 for o in octets):
+            return ".".join(str(o) for o in octets)
+    return ip
+
+
+def _normalize_domain(name):
+    """Domain về chữ thường, bỏ dấu `.` cuối (REQ-27.3)."""
+    return name.lower().rstrip(".")
+
+
+def _normalize_path(uri):
+    """URI → (path chuẩn hoá, query_string nguyên văn, lý do hoặc None).
+
+    An toàn (REQ-27.5): gộp `//`, bỏ `/./`, giải `/../` TRONG phạm vi gốc; tách
+    query. `/../` vượt gốc → DỪNG, giữ phần đã chuẩn hoá, ghi lý do — dấu hiệu
+    path traversal không được âm thầm xoá (REQ-27.6, C-21). Không percent-decode:
+    phần đã decode nằm ở `decode.query` (F2).
+    """
+    path_part, _, query = uri.partition("?")
+    query_string = query if "?" in uri else None
+    prefix = "/" if path_part.startswith("/") else ""
+    out = []
+    traversal = False
+    for segment in path_part.split("/"):
+        if segment in ("", "."):
+            continue                       # gộp '//' và bỏ '/./'
+        if segment == "..":
+            if out:
+                out.pop()                  # giải '/../' trong phạm vi gốc
+            else:
+                traversal = True           # vượt gốc -> dừng
+                break
+        else:
+            out.append(segment)
+    path = prefix + "/".join(out)
+    reason = f"path_traversal_above_root: {path_part!r}" if traversal else None
+    return path, query_string, reason
+
+
+def _ts_usec(timestamp):
+    """Chuỗi ISO 8601 → số nguyên micro giây từ epoch UTC (REQ-27.7).
+
+    Số nguyên, KHÔNG qua float: cùng lý do ADR-7 của bài 1 — float mất micro giây
+    ở độ lớn 1.79e9. delta.days/seconds/microseconds đều là số nguyên.
+    """
+    if not isinstance(timestamp, str):
+        return None
+    try:
+        moment = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return None
+    delta = moment.replace(tzinfo=timezone.utc) - _EPOCH
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _normalize(event):
+    """Điền các trường chuẩn hoá vào event["preprocess"]; trả lý do `partial`
+    của chuẩn hoá (hiện chỉ có path traversal). THÊM trường, không ghi đè (REQ-27.8).
+    """
+    pp = event["preprocess"]
+    reasons = []
+
+    transport = event.get("transport_proto")
+    if isinstance(transport, str):
+        pp["transport_proto"] = transport.upper()
+    app_proto = event.get("app_proto")
+    if isinstance(app_proto, str):
+        pp["app_proto"] = app_proto.upper()
+    if isinstance(event.get("src_ip"), str):
+        pp["src_ip"] = _normalize_ipv4(event["src_ip"])
+    if isinstance(event.get("dst_ip"), str):
+        pp["dst_ip"] = _normalize_ipv4(event["dst_ip"])
+    pp["ts_usec"] = _ts_usec(event.get("timestamp"))
+
+    app = event.get("app")
+    if app_proto == "HTTP" and app:
+        headers = app.get("headers") or []
+        # cùng số phần tử, cùng thứ tự với app.headers -> tra chỉ số ra tên gốc.
+        pp["http_header_names"] = [name.lower() for name, _ in headers]
+        for name, value in headers:
+            if name.lower() == "host" and isinstance(value, str):
+                pp["http_host"] = _normalize_domain(value)
+                break
+        if isinstance(app.get("uri"), str):
+            pp["path"], pp["query_string"], reason = _normalize_path(app["uri"])
+            if reason:
+                reasons.append(reason)
+    elif app_proto == "DNS" and app:
+        names = [q.get("name") for q in app.get("questions") or []]
+        names += [a.get("name") for a in app.get("answers") or []]
+        pp["dns_names"] = [_normalize_domain(n) for n in names if isinstance(n, str)]
+
+    return reasons
+
+
 class Preprocessor(Stage):
-    """Gắn nhãn và (T2.2/T2.3) chuẩn hoá + chặn. `process()` chưa chặn ở T2.1."""
+    """Gắn nhãn + chuẩn hoá; (T2.3) áp policy và chặn. `process()` chưa chặn ở T2.2."""
 
     name = "preprocessor"
 
@@ -103,7 +212,8 @@ class Preprocessor(Stage):
             pp["status"] = "invalid"
             pp["reasons"] = invalid
             return True
-        soft = _soft_reasons(event)
-        pp["status"] = "partial" if soft else "valid"
-        pp["reasons"] = soft
+        reasons = _soft_reasons(event)
+        reasons += _normalize(event)      # điền trường chuẩn hoá + lý do path
+        pp["status"] = "partial" if reasons else "valid"
+        pp["reasons"] = reasons
         return True
