@@ -14,6 +14,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from idps.capture.pcap import PcapSource
@@ -53,11 +54,16 @@ def count_records(path):
 
 
 def run_cli(*args):
+    # cwd là một thư mục tạm, KHÔNG phải gốc repo: lệnh không truyền
+    # --flow-output sẽ ghi flows.jsonl mặc định vào cwd; chạy ở gốc repo thì mỗi
+    # test để lại rác trong repo (bài 2). idps-config.json không có ở thư mục tạm
+    # nên Config dùng mặc định Phụ lục J — trùng giá trị với tệp mặc định của repo.
     env = dict(os.environ, PYTHONPATH=str(ROOT))
-    return subprocess.run(
-        [sys.executable, str(MAIN), *[str(a) for a in args]],
-        env=env, capture_output=True, text=True,
-    )
+    with tempfile.TemporaryDirectory() as scratch:
+        return subprocess.run(
+            [sys.executable, str(MAIN), *[str(a) for a in args]],
+            cwd=scratch, env=env, capture_output=True, text=True,
+        )
 
 
 def run_on_lab_pcap(out):
