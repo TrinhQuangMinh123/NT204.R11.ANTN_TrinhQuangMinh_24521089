@@ -404,3 +404,210 @@ def test_application_protocol_set_once_and_kept():
     first_flow, other_flow = close_all(tracker)
     assert first_flow["application_protocol"] == "HTTP"
     assert other_flow["application_protocol"] is None            # UNKNOWN không tính
+
+
+# --- T3.5 hết hạn theo trạng thái, bảng đầy, lý do đóng -----------------------
+
+SEC = 1_000_000
+# Năm ngưỡng KHÁC NHAU để ca nào tra nhầm ngưỡng thì test fail.
+LIMITS = Config.load(None, [("tcp.new", "10"), ("tcp.established", "100"),
+                            ("tcp.closed", "20"), ("udp.new", "5"),
+                            ("udp.established", "50")])
+
+
+class RecordingSink:
+    """Sink giả: giữ record, và gọi `on_handle` để test soi trạng thái lúc nhận."""
+
+    def __init__(self, on_handle=None):
+        self.records, self.closed, self.on_handle = [], False, on_handle
+
+    def handle(self, record):
+        if self.on_handle:
+            self.on_handle(record)
+        self.records.append(record)
+
+    def close(self):
+        self.closed = True
+
+
+def other_flow(ts):
+    """Packet của một flow KHÁC, chỉ để đẩy đồng hồ tới `ts`."""
+    return udp_event("10.99.0.1", 1, "10.99.0.2", 2, ts=ts)
+
+
+def reasons_closed(sink, flow_id):
+    return [r["close_reason"] for r in sink.records if r["flow_id"] == flow_id]
+
+
+def at_ts(event, ts):
+    event["preprocess"]["ts_usec"] = ts
+    return event
+
+
+CASES = {   # tên: (các packet dựng flow 1 ở ts=0, ngưỡng giây, close_reason)
+    "tcp_handshake": ([("c", ["SYN"])], 10, "idle_new"),
+    "tcp_established": ([("c", ["ACK"])], 100, "idle_established"),
+    "tcp_closing": ([("c", ["ACK"]), ("c", ["FIN", "ACK"])], 100, "idle_established"),
+    "tcp_closed": ([("c", ["ACK"]), ("c", ["FIN", "ACK"]), ("s", ["FIN", "ACK"]),
+                    ("c", ["ACK"])], 20, "idle_closed"),
+    "tcp_reset": ([("c", ["ACK"]), ("s", ["RST"])], 20, "idle_closed"),
+}
+
+
+def test_expire_per_state():
+    for name, (packets, limit, expected) in CASES.items():
+        sink = RecordingSink()
+        tracker = FlowTracker(LIMITS, [sink])
+        for side, flags in packets:
+            src = (A, 5000, B, 80) if side == "c" else (B, 80, A, 5000)
+            tracker.process(tcp_event(*src, flags, ts=0))
+        tracker.process(other_flow(limit * SEC))          # đúng ngưỡng: CHƯA hết hạn
+        assert sink.records == [], name
+        tracker.process(other_flow(limit * SEC + 1))      # quá ngưỡng 1 µs
+        assert reasons_closed(sink, 1) == [expected], name
+
+
+def test_expire_udp_by_direction_seen():
+    sink = RecordingSink()
+    tracker = FlowTracker(LIMITS, [sink])
+    tracker.process(udp_event(A, 40000, B, 53, ts=0))                 # flow 1: một chiều
+    tracker.process(udp_event(A, 41000, B, 53, ts=0))                 # flow 2: …
+    tracker.process(udp_event(B, 53, A, 41000, ts=0))                 # … đã có chiều ngược
+    tracker.process(other_flow(5 * SEC + 1))                          # quá udp.new (5)
+    assert reasons_closed(sink, 1) == ["idle_new"]
+    assert reasons_closed(sink, 2) == []                              # ngưỡng 50, chưa tới
+    tracker.process(other_flow(50 * SEC + 1))
+    assert reasons_closed(sink, 2) == ["idle_established"]
+
+
+def test_closed_lingers():
+    sink = RecordingSink()
+    tracker = FlowTracker(LIMITS, [sink])
+    for side, flags in (("c", ["ACK"]), ("c", ["FIN", "ACK"]), ("s", ["FIN", "ACK"]),
+                        ("c", ["ACK"])):
+        src = (A, 5000, B, 80) if side == "c" else (B, 80, A, 5000)
+        tracker.process(tcp_event(*src, flags, ts=0))
+    retransmit = at_ts(tcp_event(B, 80, A, 5000, ["FIN", "ACK"]), 15 * SEC)  # < tcp.closed
+    tracker.process(retransmit)
+    assert retransmit["flow"]["flow_id"] == 1                         # không đẻ flow mới
+    assert retransmit["flow"]["state"] == "CLOSED"
+    assert sink.records == []                                         # còn trong bảng
+    assert tracker.table.flows()[0].packet_count == 5                 # packet muộn được đếm
+    tracker.process(other_flow(15 * SEC + 20 * SEC + 1))              # last_seen mới = 15s
+    assert reasons_closed(sink, 1) == ["idle_closed"]
+
+
+def test_clock_from_packet():
+    sink = RecordingSink()
+    tracker = FlowTracker(LIMITS, [sink])
+    tracker.process(tcp_event(A, 5000, B, 80, ["SYN"], ts=0))
+    tracker.process(other_flow(2 * 3600 * SEC))        # đẩy timestamp lên 2 giờ, không chờ thật
+    assert reasons_closed(sink, 1) == ["idle_new"]
+    assert sink.records[0]["close_time"] == "1970-01-01T02:00:00.000000Z"
+
+
+def test_clock_never_goes_backwards():
+    tracker = FlowTracker(LIMITS, [RecordingSink()])
+    tracker.process(other_flow(100 * SEC))
+    tracker.process(other_flow(10 * SEC))               # timestamp lùi
+    assert tracker.clock_usec == 100 * SEC
+    flow = tracker.table.flows()[0]
+    assert flow.last_seen_usec == 100 * SEC and flow.last_seen_usec >= flow.start_usec
+
+
+def test_expire_before_assign():
+    sink = RecordingSink()
+    tracker = FlowTracker(LIMITS, [sink])
+    first = tcp_event(A, 5000, B, 80, ["SYN"], ts=0)
+    again = tcp_event(A, 5000, B, 80, ["SYN"], ts=11 * SEC)    # quá tcp.new (10)
+    tracker.process(first)
+    tracker.process(again)
+    assert first["flow"]["flow_id"] == 1
+    assert again["flow"]["flow_id"] == 2                      # flow MỚI, không hồi sinh flow cũ
+    assert reasons_closed(sink, 1) == ["idle_new"]
+    assert again["flow"]["direction"] == "forward"
+
+
+def test_table_full():
+    sink = RecordingSink()
+    cfg = Config.load(None, [("max_active_flows", "3")])
+    tracker = FlowTracker(cfg, [sink])
+    for n in range(10):
+        tracker.process(tcp_event(A, 5000 + n, B, 80, ["SYN"], ts=n))
+        assert len(tracker.table) <= 3                        # I-17: mọi thời điểm
+    assert [r["close_reason"] for r in sink.records] == ["table_full"] * 7
+    assert [r["flow_id"] for r in sink.records] == [1, 2, 3, 4, 5, 6, 7]   # cũ nhất trước
+
+
+def test_table_full_existing_flow_does_not_evict():
+    sink = RecordingSink()
+    tracker = FlowTracker(Config.load(None, [("max_active_flows", "2")]), [sink])
+    for n in range(2):
+        tracker.process(tcp_event(A, 5000 + n, B, 80, ["SYN"], ts=n))
+    tracker.process(tcp_event(A, 5000, B, 80, ["ACK"], ts=5))   # flow đã có -> không cần chỗ
+    assert sink.records == [] and len(tracker.table) == 2
+
+
+def test_evict_picks_oldest_last_seen_not_oldest_created():
+    sink = RecordingSink()
+    tracker = FlowTracker(Config.load(None, [("max_active_flows", "2")]), [sink])
+    tracker.process(tcp_event(A, 5000, B, 80, ["SYN"], ts=0))   # flow 1
+    tracker.process(tcp_event(A, 5001, B, 80, ["SYN"], ts=1))   # flow 2
+    tracker.process(tcp_event(A, 5000, B, 80, ["ACK"], ts=2))   # flow 1 vừa hoạt động
+    tracker.process(tcp_event(A, 5002, B, 80, ["SYN"], ts=3))   # cần chỗ
+    assert [r["flow_id"] for r in sink.records] == [2]
+
+
+def test_record_before_removal():
+    seen_in_table = []
+
+    def check(record):
+        seen_in_table.append(record["flow_id"] in [f.flow_id for f in tracker.table.flows()])
+
+    sink = RecordingSink(on_handle=check)
+    tracker = FlowTracker(LIMITS, [sink])
+    tracker.process(tcp_event(A, 5000, B, 80, ["SYN"], ts=0))
+    tracker.process(other_flow(11 * SEC))                      # hết hạn
+    tracker.close()                                            # end_of_run
+    assert seen_in_table == [True, True]                       # record tới sink khi flow CÒN trong bảng
+    assert len(tracker.table) == 0
+
+
+def test_every_flow_closed_once():
+    sink = RecordingSink()
+    tracker = FlowTracker(Config.load(None, [("max_active_flows", "4"), ("tcp.new", "10")]),
+                          [sink])
+    for n in range(12):                                        # đủ cả table_full, hết hạn
+        tracker.process(tcp_event(A, 5000 + n, B, 80, ["SYN"], ts=n * 3 * SEC))
+    tracker.close()
+    created = tracker._next_flow_id - 1
+    ids = [r["flow_id"] for r in sink.records]
+    assert created == 12 and len(ids) == 12 and len(set(ids)) == 12
+    assert {r["close_reason"] for r in sink.records} >= {"idle_new", "end_of_run"}
+
+
+def test_close_flushes_before_closing_sinks():
+    log = []
+
+    class Sink(RecordingSink):
+        def handle(self, record):
+            log.append("record")
+
+        def close(self):
+            log.append("close")
+
+    tracker = FlowTracker(LIMITS, [Sink()])
+    tracker.process(tcp_event(A, 5000, B, 80, ["SYN"], ts=0))
+    tracker.process(tcp_event(A, 5001, B, 80, ["SYN"], ts=1))
+    tracker.close()
+    assert log == ["record", "record", "close"]
+
+
+def test_end_of_run_flushes_in_creation_order():
+    sink = RecordingSink()
+    tracker = FlowTracker(LIMITS, [sink])
+    for n in range(3):
+        tracker.process(tcp_event(A, 5000 + n, B, 80, ["SYN"], ts=0))
+    tracker.close()
+    assert [r["flow_id"] for r in sink.records] == [1, 2, 3]
+    assert {r["close_reason"] for r in sink.records} == {"end_of_run"}

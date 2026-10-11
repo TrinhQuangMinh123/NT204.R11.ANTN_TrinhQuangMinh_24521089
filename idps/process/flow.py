@@ -14,6 +14,20 @@ _PROTOCOLS = ("TCP", "UDP")
 
 _ANY = None   # "bất kỳ trạng thái" trong bảng chuyển trạng thái
 
+# --- ngưỡng im lặng THEO TRẠNG THÁI (REQ-33.1, design §6) --------------------
+# Tra bảng chứ không một con số chung: SYN chưa được trả lời (quét cổng) phải hết
+# hạn sớm, phiên đã thiết lập thì được im lặng lâu hơn. (khoá cấu hình, close_reason)
+_TCP_IDLE = {
+    "HANDSHAKE":   ("tcp.new", "idle_new"),
+    "ESTABLISHED": ("tcp.established", "idle_established"),
+    "CLOSING":     ("tcp.established", "idle_established"),
+    "CLOSED":      ("tcp.closed", "idle_closed"),
+    "RESET":       ("tcp.closed", "idle_closed"),
+}
+_UDP_IDLE_ONE_WAY = ("udp.new", "idle_new")
+_UDP_IDLE_BOTH_WAYS = ("udp.established", "idle_established")
+_USEC_PER_SEC = 1_000_000
+
 # Phiên bản schema của flow record — bộ đếm RIÊNG, không dùng chung với event (35.3).
 FLOW_SCHEMA_VERSION = 1
 _FLAG_COUNTERS = (("SYN", "syn_count"), ("ACK", "ack_count"),
@@ -82,6 +96,19 @@ class Flow:
         self.flag_counts = {name: 0 for _, name in _FLAG_COUNTERS}
         self.application_protocol = None
         self.notes = []                # ghi chú mức flow, vào `reasons` của record
+        self.close_reason = None       # FlowTable.expire / FlowTracker đặt lúc đóng
+
+    def idle_rule(self):
+        """(khoá cấu hình, close_reason) ứng với trạng thái hiện tại của flow.
+
+        UDP luôn `ACTIVE`; thứ đổi ngưỡng là đã thấy chiều ngược hay chưa, nên tra
+        theo `backward_packet_count` chứ không theo `state` (design §6).
+        """
+        if self.protocol == "TCP":
+            return _TCP_IDLE[self.state]
+        if self.direction_packets["backward"] == 0:
+            return _UDP_IDLE_ONE_WAY
+        return _UDP_IDLE_BOTH_WAYS
 
     def update(self, event, direction):
         """Tính packet này vào flow: trạng thái, counter rồi mốc thời gian (§6, bước 6).
@@ -92,7 +119,10 @@ class Flow:
         ts = event["preprocess"].get("ts_usec")
         if self.start_usec is None:
             self.start_usec = ts
-        self.last_seen_usec = ts
+        # max(): PCAP dựng từ nhiều interface có thể có timestamp lùi; last_seen lùi
+        # sẽ cho duration âm và làm flow trông hết hạn sớm hơn thực tế.
+        if self.last_seen_usec is None or ts > self.last_seen_usec:
+            self.last_seen_usec = ts
         if self.protocol == "TCP":
             self._step_tcp(event, direction)
         else:
@@ -250,9 +280,38 @@ class FlowTable:
     def __len__(self):
         return len(self._flows)
 
+    def __contains__(self, key):
+        return key in self._flows
+
     def flows(self):
         """Các flow đang active, theo thứ tự được tạo (thứ tự chèn của dict)."""
         return list(self._flows.values())
+
+    def expire(self, now_usec, config):
+        """Flow đã im lặng QUÁ ngưỡng của trạng thái nó, theo thứ tự được tạo.
+
+        Chỉ TRA, không xoá: tracker phải ghi flow record ra rồi mới `remove` (I-18).
+        Đặt `flow.close_reason` vì lý do đóng phụ thuộc trạng thái LÚC hết hạn.
+        Duyệt cả bảng mỗi packet: lab chỉ vài chục flow (A11, ADR-23 phương án A).
+        """
+        expired = []
+        for flow in self._flows.values():
+            key, reason = flow.idle_rule()
+            if now_usec - flow.last_seen_usec > config[key] * _USEC_PER_SEC:
+                flow.close_reason = reason
+                expired.append(flow)
+        return expired
+
+    def evict_oldest(self):
+        """Flow có `last_seen` cũ nhất (hoà → flow tạo trước), hoặc None nếu bảng rỗng."""
+        if not self._flows:
+            return None
+        flow = min(self._flows.values(), key=lambda f: f.last_seen_usec)
+        flow.close_reason = "table_full"
+        return flow
+
+    def remove(self, flow):
+        del self._flows[flow.key]
 
     def get_or_create(self, key, event):
         """Trả `(flow, vừa_tạo)`. Flow mới lấy NGUỒN của event làm endpoint A."""
@@ -276,10 +335,12 @@ class FlowTracker(Stage):
 
     name = "flow"
 
-    def __init__(self, config):
+    def __init__(self, config, flow_sinks=()):
         self.config = config
+        self.flow_sinks = list(flow_sinks)   # nhận flow record (ADR-25), không nhận event
         self.table = FlowTable()
         self._next_flow_id = 1
+        self.clock_usec = 0                  # "bây giờ" = timestamp packet, đơn điệu tăng
 
     def process(self, event):
         src, dst, protocol, problem = _endpoints(event)
@@ -289,6 +350,13 @@ class FlowTracker(Stage):
             return True                    # vẫn đi tiếp: không đủ 5-tuple không phải lỗi
 
         key = FlowTable.make_key(protocol, src, dst)
+        self._advance_clock(event)
+        # Hết hạn TRƯỚC khi gán packet (REQ-33.6): packet đến sau timeout mở flow mới.
+        for expired in self.table.expire(self.clock_usec, self.config):
+            self._close(expired, expired.close_reason)
+        if key not in self.table:
+            while len(self.table) >= self.config["max_active_flows"]:
+                self._close(self.table.evict_oldest(), "table_full")
         flow, created = self.table.get_or_create(key, event)
         if created:
             flow.flow_id = self._next_flow_id
@@ -300,3 +368,33 @@ class FlowTracker(Stage):
         event["flow"]["direction"] = direction
         event["flow"]["state"] = flow.state     # trạng thái SAU khi tính packet này
         return True
+
+    def _advance_clock(self, event):
+        """`now = max(now, ts)`: lấy từ packet, không từ giờ hệ thống (REQ-33.2).
+
+        Replay PCAP cũ vẫn hết hạn đúng, và kết quả không phụ thuộc tốc độ máy. Giữ
+        đơn điệu để một packet có timestamp lùi không làm mọi flow "trẻ lại" (§4.3).
+        """
+        ts = event["preprocess"].get("ts_usec")
+        if ts is not None and ts > self.clock_usec:
+            self.clock_usec = ts
+
+    def _close(self, flow, reason):
+        """Chốt sổ flow: ghi record tới MỌI sink rồi mới cho rời bảng (I-18).
+
+        Hết hạn là lúc *sinh ra* bằng chứng, không phải lúc xoá nó (REQ-33.1b).
+        """
+        record = flow.to_record(self.clock_usec, reason)
+        for sink in self.flow_sinks:
+            sink.handle(record)
+        self.table.remove(flow)
+
+    def close(self):
+        """Hết lần chạy: xả MỌI flow còn lại (end_of_run) rồi mới đóng các sink.
+
+        Đảo thứ tự thì sink đã đóng khi record cuối được gửi → mất bằng chứng.
+        """
+        for flow in self.table.flows():
+            self._close(flow, "end_of_run")
+        for sink in self.flow_sinks:
+            sink.close()
