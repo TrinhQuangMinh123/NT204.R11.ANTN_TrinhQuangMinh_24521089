@@ -21,6 +21,7 @@ from idps.output.jsonl import JsonlWriter
 from idps.process.chain import ProcessingChain
 from idps.process.config import Config, ConfigError
 from idps.process.decoder import Decoder
+from idps.process.preprocessor import Preprocessor
 
 PROG = "main.py"
 DEFAULT_OUTPUT = "events.jsonl"
@@ -80,10 +81,11 @@ def build_sinks(args, config) -> list:
 
     Bài 2: chuỗi stage (Decoder → Preprocessor → FlowTracker) gói trong MỘT
     `ProcessingChain` đứng TRƯỚC bộ ghi event, nên event chỉ được ghi SAU khi đã
-    đi qua các stage (ADR-17). Phase 1 có Decoder; Preprocessor và FlowTracker
-    nối vào đúng danh sách này ở phase sau. Runner, JsonlWriter của bài 1 không đổi.
+    đi qua các stage (ADR-17). Phase 2 có Decoder → Preprocessor; FlowTracker nối
+    vào đúng danh sách này ở Phase 3. Runner, JsonlWriter của bài 1 không đổi.
     """
-    return [ProcessingChain([Decoder(config)]), JsonlWriter(args.output)]
+    chain = ProcessingChain([Decoder(config), Preprocessor(config)])
+    return [chain, JsonlWriter(args.output)]
 
 
 def build_flow_sinks(args) -> list:
