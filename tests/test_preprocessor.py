@@ -20,8 +20,10 @@ def base_event(**overrides):
     return event
 
 
-def run(event):
-    assert Preprocessor(CFG).process(event) is True
+def run(event, config=CFG):
+    """Chạy Preprocessor, trả khoá preprocess. (T2.3: invalid/skip trả False —
+    không assert giá trị trả ở đây; cổng chặn có test riêng.)"""
+    Preprocessor(config).process(event)
     return event["preprocess"]
 
 
@@ -187,3 +189,62 @@ def test_ts_usec_matches_timestamp_string():
     usec = pp["ts_usec"]
     assert isinstance(usec, int)
     assert format_timestamp(usec // 1_000_000, usec % 1_000_000) == "2026-09-27T05:22:03.123456Z"
+
+
+# --- T2.3 metadata + policy + cổng chặn (REQ-28, REQ-29) -------------------
+
+SKIP_CFG = Config.load(None, [("missing_data_policy", "skip")])
+VALUES_STATUS = {"valid", "partial", "invalid"}
+VALUES_ACTION = {"forwarded", "marked", "skipped"}
+
+
+def test_valid_is_forwarded_with_no_reasons():
+    keep = Preprocessor(CFG).process(ev := base_event())
+    pp = ev["preprocess"]
+    assert (pp["status"], pp["action"], pp["reasons"]) == ("valid", "forwarded", [])
+    assert keep is True
+
+
+def test_every_non_forwarded_event_has_a_reason():
+    cases = [base_event(status="malformed"), base_event(src_port="x"),
+             base_event(app_proto="UNKNOWN")]
+    for event in cases:
+        pp = run(event)
+        if not (pp["status"] == "valid" and pp["action"] == "forwarded"):
+            assert len(pp["reasons"]) >= 1          # REQ-29.3
+
+
+def test_mark_policy_marks_and_continues():
+    keep = Preprocessor(CFG).process(ev := base_event(status="malformed"))
+    assert ev["preprocess"]["action"] == "marked"
+    assert keep is True
+
+
+def test_skip_policy_blocks_missing_data():
+    keep = Preprocessor(SKIP_CFG).process(ev := base_event(status="malformed"))
+    assert ev["preprocess"]["action"] == "skipped"
+    assert ev["preprocess"]["reasons"]
+    assert keep is False
+
+
+def test_invalid_blocks_flow_tracker():
+    keep = Preprocessor(CFG).process(ev := base_event(src_port=70000))
+    assert ev["preprocess"]["status"] == "invalid"
+    assert keep is False
+
+
+def test_unknown_proto_continues_even_under_skip():
+    # REQ-28.4: packet proto UNKNOWN là bằng chứng port scan -> vẫn xuống flow.
+    keep = Preprocessor(SKIP_CFG).process(ev := base_event(app_proto="UNKNOWN"))
+    assert ev["preprocess"]["status"] == "partial"
+    assert ev["preprocess"]["action"] == "marked"
+    assert keep is True
+
+
+def test_status_and_action_use_fixed_vocabulary():
+    cases = [base_event(), base_event(status="malformed"),
+             base_event(app_proto="UNKNOWN"), base_event(src_port=70000)]
+    for event in cases:
+        pp = run(event)
+        assert pp["status"] in VALUES_STATUS
+        assert pp["action"] in VALUES_ACTION

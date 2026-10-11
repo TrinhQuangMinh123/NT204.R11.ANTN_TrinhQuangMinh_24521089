@@ -198,7 +198,13 @@ def _normalize(event):
 
 
 class Preprocessor(Stage):
-    """Gắn nhãn + chuẩn hoá; (T2.3) áp policy và chặn. `process()` chưa chặn ở T2.2."""
+    """Kiểm tra + chuẩn hoá + áp `missing_data_policy`, gắn status/action/reasons.
+
+    Trả `False` để CHẶN khỏi Flow Tracker đúng hai ca: `invalid` (REQ-26.4) và
+    `partial` do dữ liệu thiếu khi policy = `skip` (REQ-28.3). Chặn chỉ dừng các
+    stage SAU trong chuỗi — event vẫn tới JsonlWriter (sink riêng) nên "bị bỏ qua
+    vẫn để lại dấu vết" (ADR-17, REQ-28.3). Mọi event đều có đủ ba trường metadata.
+    """
 
     name = "preprocessor"
 
@@ -207,13 +213,28 @@ class Preprocessor(Stage):
 
     def process(self, event):
         pp = event["preprocess"]
+
         invalid = _validate(event)
         if invalid:
             pp["status"] = "invalid"
+            pp["action"] = "skipped"      # không xuống Flow Tracker, vẫn được ghi
             pp["reasons"] = invalid
-            return True
+            return False
+
         reasons = _soft_reasons(event)
-        reasons += _normalize(event)      # điền trường chuẩn hoá + lý do path
-        pp["status"] = "partial" if reasons else "valid"
+        reasons += _normalize(event)
         pp["reasons"] = reasons
+        if not reasons:
+            pp["status"] = "valid"
+            pp["action"] = "forwarded"
+            return True
+
+        pp["status"] = "partial"
+        # policy `skip` chỉ áp cho dữ liệu THIẾU; proto UNKNOWN (unsupported) vẫn
+        # phải xuống Flow Tracker vì là bằng chứng port scan (REQ-28.4).
+        missing_data = any(not reason.startswith("unsupported") for reason in reasons)
+        if missing_data and self.config["missing_data_policy"] == "skip":
+            pp["action"] = "skipped"
+            return False
+        pp["action"] = "marked"
         return True
