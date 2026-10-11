@@ -3,11 +3,16 @@
 Mỗi ca đã đo ở ADR-20/ADR-21 là một test trực tiếp (chiến lược §9). entity_decode
 và mime_decode có test riêng ở T1.2/T1.3.
 """
+from idps.core.event import b64
 from idps.process.codecs import (
+    aggregate_status,
+    base64_decode,
     decoded,
     entity_decode,
     form_decode,
+    mime_decode,
     percent_decode,
+    qp_decode,
     to_text,
 )
 
@@ -161,3 +166,126 @@ def test_entity_plain_ampersand_not_flagged():
         dv = entity_decode(text)
         assert dv["status"] == "ok", text
         assert dv["reasons"] == []
+
+
+# --- aggregate_status (§5.1) -----------------------------------------------
+
+def test_aggregate_severity_order():
+    assert aggregate_status(["ok", "invalid"]) == "invalid"
+    assert aggregate_status(["ok", "partial"]) == "partial"
+    assert aggregate_status(["not_encoded", "ok"]) == "not_encoded"
+    assert aggregate_status(["not_applicable"]) == "not_applicable"
+    assert aggregate_status([]) == "not_applicable"
+
+
+# --- base64_decode (F6/F8) — REQ-23.1, 23.7 --------------------------------
+
+def test_base64_decode_strips_folding_whitespace():
+    dv = base64_decode(b"SGVs\r\nbG8=", LIMIT)
+    assert dv["value"] == b"Hello"
+    assert dv["status"] == "ok"
+
+
+def test_base64_decode_stray_char_is_invalid_not_silent():
+    dv = base64_decode(b"SGVs*bG8=", LIMIT)
+    assert dv["status"] == "invalid"
+    assert dv["value"] != b"Hello"          # KHÔNG âm thầm ra Hello
+    assert dv["value"] == b"Hel"            # giữ phần giải mã được (tiền tố hợp lệ)
+
+
+def test_base64_decode_over_limit():
+    dv = base64_decode(b"A" * 100, 10)
+    assert dv["value"] is None
+    assert any("10" in r for r in dv["reasons"])
+
+
+# --- qp_decode (F6/F8) — REQ-23.2, 23.7 ------------------------------------
+
+def test_qp_decode_valid():
+    assert qp_decode(b"Hello=20World", LIMIT)["value"] == b"Hello World"
+
+
+def test_qp_decode_soft_line_break():
+    dv = qp_decode(b"Hel=\r\nlo", LIMIT)
+    assert dv["value"] == b"Hello"
+    assert dv["status"] == "ok"
+
+
+def test_qp_decode_invalid_escape_is_invalid_with_position():
+    dv = qp_decode(b"bad=ZZhere", LIMIT)
+    assert dv["status"] == "invalid"
+    assert dv["value"] == b"bad=ZZhere"     # quopri giữ nguyên đoạn sai
+    assert "invalid_qp_escape_at=3" in dv["reasons"][0]
+
+
+# --- mime_decode (F6) — REQ-23.1–23.8 --------------------------------------
+
+def _mime(headers_and_body):
+    return headers_and_body.replace(b"\n", b"\r\n")
+
+
+def test_mime_single_base64_part():
+    data = _mime(b"Content-Type: text/plain\nContent-Transfer-Encoding: base64\n\nSGVsbG8=")
+    dv = mime_decode(data, LIMIT)
+    assert dv["rule"] == "F6"
+    assert dv["status"] == "ok"
+    parts = dv["value"]["parts"]
+    assert len(parts) == 1
+    assert parts[0]["index"] == 0
+    assert parts[0]["encoding"] == "base64"
+    assert parts[0]["text"] == "Hello"
+    assert parts[0]["status"] == "ok"
+    assert parts[0]["bytes_b64"] == b64(b"SGVsbG8=")   # bytes GỐC (REQ-23.8)
+
+
+def test_mime_invalid_base64_part_not_silent():
+    data = _mime(b"Content-Transfer-Encoding: base64\n\nSGVs*bG8=")
+    parts = mime_decode(data, LIMIT)["value"]["parts"]
+    assert parts[0]["status"] == "invalid"
+    assert parts[0]["text"] != "Hello"
+
+
+def test_mime_multipart_each_part_has_own_status():
+    data = _mime(
+        b'Content-Type: multipart/mixed; boundary="B"\n'
+        b"\n"
+        b"--B\n"
+        b"Content-Transfer-Encoding: base64\n"
+        b"\n"
+        b"SGVsbG8=\n"
+        b"--B\n"
+        b"Content-Type: text/plain\n"
+        b"\n"
+        b"plain text\n"
+        b"--B--\n"
+    )
+    dv = mime_decode(data, LIMIT)
+    parts = dv["value"]["parts"]
+    assert len(parts) == 2                       # hai phần lá
+    assert parts[0]["encoding"] == "base64" and parts[0]["text"] == "Hello"
+    assert parts[1]["status"] == "not_encoded"   # phần không khai CTE = 7bit
+
+
+def test_mime_missing_separator_is_deferred_to_flow():
+    data = b"Content-Transfer-Encoding: base64\r\nSGVsbG8="   # thiếu dòng trống
+    dv = mime_decode(data, LIMIT)
+    assert dv["status"] == "deferred_to_flow"
+    assert "MissingHeaderBodySeparatorDefect" in dv["value"]["defects"]
+
+
+def test_mime_unsupported_encoding():
+    data = _mime(b"Content-Transfer-Encoding: x-uuencode\n\nbegin 644 x")
+    parts = mime_decode(data, LIMIT)["value"]["parts"]
+    assert parts[0]["status"] == "unsupported"
+
+
+def test_mime_7bit_is_not_encoded():
+    data = _mime(b"Content-Transfer-Encoding: 7bit\n\nplain ascii")
+    parts = mime_decode(data, LIMIT)["value"]["parts"]
+    assert parts[0]["status"] == "not_encoded"
+    assert parts[0]["text"] == "plain ascii"
+
+
+def test_mime_over_limit():
+    dv = mime_decode(b"A" * 100, 10)
+    assert dv["value"] is None

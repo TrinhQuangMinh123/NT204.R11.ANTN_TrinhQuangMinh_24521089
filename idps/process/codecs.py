@@ -14,10 +14,18 @@ kiến là dữ liệu, trả qua `status`/`reasons` (ADR-4 của bài 1).
 Lưu ý tên tệp: đây là `idps.process.codecs`, KHÔNG che `codecs` của thư viện
 chuẩn — Python 3 dùng absolute import nên `import codecs` ở nơi khác vẫn ra stdlib.
 """
+import base64
+import binascii
+import email
+import email.policy
 import html
 import html.entities
+import quopri
 import re
+import string
 import urllib.parse
+
+from ..core.event import b64
 
 _HEX = set("0123456789abcdefABCDEF")
 
@@ -161,3 +169,193 @@ def entity_decode(value):
             reasons.append(f"entity_without_semicolon_at={match.start()}")  # REQ-22.6
     status = "partial" if reasons else "ok"
     return decoded(html.unescape(value), None, status, reasons)
+
+
+# --- tổng hợp trạng thái (§5.1) — dùng chung cho mime_decode và Decoder -----
+
+# Thứ tự nghiêm trọng: cái nói "dữ liệu sai" thắng cái nói "phạm vi hỗ trợ", cái
+# "chưa làm gì" xếp cuối. Mục đứng trước = nghiêm trọng hơn.
+SEVERITY = (
+    "invalid", "unsupported", "unknown_encoding", "partial",
+    "deferred_to_flow", "not_encoded", "ok", "not_applicable",
+)
+
+
+def aggregate_status(statuses):
+    """Trạng thái nghiêm trọng nhất trong danh sách; rỗng → `not_applicable`."""
+    if not statuses:
+        return "not_applicable"
+    return min(statuses, key=SEVERITY.index)
+
+
+# --- Base64 và Quoted-Printable (F6/F8) — trả BYTES đã giải mã --------------
+# Hai hàm này là primitive nội bộ: value là bytes (không phải str/JSON). mime_decode
+# đưa bytes đó qua to_text (ra `text`) và b64 (ra `bytes_b64`) để thành JSON.
+
+_B64_ALPHABET = set((string.ascii_letters + string.digits + "+/=").encode("ascii"))
+_HEX_BYTES = set(b"0123456789abcdefABCDEF")
+
+
+def _valid_b64_prefix(data):
+    """Tiền tố Base64 hợp lệ, căn bội số 4 — để giữ phần giải mã được (REQ-23.7)."""
+    n = 0
+    for byte in data:
+        if byte in _B64_ALPHABET:
+            n += 1
+        else:
+            break
+    return data[: n - (n % 4)]
+
+
+def base64_decode(data, limit):
+    """Giải Base64 (F6/F8) → bytes. `validate=True` SAU khi tự bỏ khoảng trắng.
+
+    `validate=True` coi cả `\\r\\n` là ký tự sai, mà body MIME thật luôn gập dòng
+    → phải bỏ khoảng trắng trước (đo: `"SGVs\\r\\nbG8="` → `b"Hello"`). KHÔNG dùng
+    `validate=False` cho cả cụm vì nó *im lặng* bỏ ký tự lạ (`"SGVs*bG8="` → `b"Hello"`),
+    tức payload cố tình nhiễu vẫn ra `ok`. Sai → `invalid`, giữ phần giải mã được
+    từ tiền tố hợp lệ (REQ-23.7).
+    """
+    if len(data) > limit:
+        return _over_limit(data, limit)
+    stripped = b"".join(data.split())
+    try:
+        return decoded(base64.b64decode(stripped, validate=True), None, "ok")
+    except binascii.Error as exc:
+        try:
+            salvaged = base64.b64decode(_valid_b64_prefix(stripped), validate=False)
+        except binascii.Error:
+            salvaged = b""
+        return decoded(salvaged, None, "invalid", [f"base64_invalid: {exc}"])
+
+
+def _first_invalid_qp(data):
+    """Vị trí `=` đầu tiên KHÔNG phải `=XX` (hex) cũng không phải soft line break."""
+    i = data.find(b"=")
+    n = len(data)
+    while i != -1:
+        if i + 1 == n or data[i + 1] in (0x0D, 0x0A):
+            pass                                       # '=' cuối chuỗi / '=\r' / '=\n'
+        elif i + 2 < n and data[i + 1] in _HEX_BYTES and data[i + 2] in _HEX_BYTES:
+            pass                                       # '=XX' hợp lệ
+        else:
+            return i
+        i = data.find(b"=", i + 1)
+    return None
+
+
+def qp_decode(data, limit):
+    """Giải Quoted-Printable (F6/F8) → bytes. `quopri` KHÔNG bao giờ báo lỗi:
+    `=ZZ` giữ nguyên, `=` cuối bị bỏ. Nên tự quét `=` không theo sau hai chữ số
+    hex (và không phải soft line break) → `invalid` + vị trí (REQ-23.7)."""
+    if len(data) > limit:
+        return _over_limit(data, limit)
+    bad = _first_invalid_qp(data)
+    status = "ok"
+    reasons = []
+    if bad is not None:
+        status = "invalid"
+        reasons.append(f"invalid_qp_escape_at={bad}")
+    return decoded(quopri.decodestring(data), None, status, reasons)
+
+
+# --- Bóc tách MIME (F6/F8) --------------------------------------------------
+
+_NOT_ENCODED = {"7bit", "8bit", "binary"}
+# Token của RFC 2045: chữ/số và một số dấu, KHÔNG có khoảng trắng hay CTL.
+_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.0-9A-Z^_`a-z{|}~]+$")
+
+
+def _classify_cte(raw_cte):
+    """Phân loại `Content-Transfer-Encoding` → (kind, verbatim).
+
+    kind ∈ base64 · qp · not_encoded · unsupported · unknown. Phân biệt
+    `unsupported` (token đọc được, chưa cài — vd `x-uuencode`) với
+    `unknown_encoding` (giá trị không phải token đọc được: rỗng, khoảng trắng,
+    ký tự lạ) theo §5.1 — một IDS phải phân biệt "ta thiếu tính năng" với "thư
+    hỏng/cố tình nhiễu".
+    """
+    if raw_cte is None:
+        return "not_encoded", None                     # vắng CTE = 7bit (RFC 2045)
+    token = raw_cte.strip().lower()
+    if not token or not _TOKEN_RE.match(raw_cte.strip()):
+        return "unknown", raw_cte
+    if token == "base64":
+        return "base64", raw_cte
+    if token == "quoted-printable":
+        return "qp", raw_cte
+    if token in _NOT_ENCODED:
+        return "not_encoded", raw_cte
+    return "unsupported", raw_cte
+
+
+def _leaf_parts(msg):
+    """Các phần LÁ của thư (không phải container multipart). Thư đơn → chính nó."""
+    return [part for part in msg.walk() if not part.is_multipart()]
+
+
+def _decode_part(index, part, limit):
+    """Một phần lá → mục của `parts[]` (§5.2): index, content_type, encoding,
+    text, bytes_b64 (bytes GỐC — REQ-23.8), status, reasons."""
+    kind, encoding = _classify_cte(part.get("Content-Transfer-Encoding"))
+    payload = part.get_payload(decode=False)
+    # latin-1 là song ánh byte 0..255 -> lấy lại đúng bytes mã hoá gốc của phần.
+    encoded = payload.encode("latin-1", "replace") if isinstance(payload, str) else b""
+    reasons = []
+    if kind == "base64":
+        dv = base64_decode(encoded, limit)
+        body, status, reasons = dv["value"], dv["status"], dv["reasons"]
+    elif kind == "qp":
+        dv = qp_decode(encoded, limit)
+        body, status, reasons = dv["value"], dv["status"], dv["reasons"]
+    elif kind == "not_encoded":
+        body, status = encoded, "not_encoded"
+    elif kind == "unsupported":
+        body, status = encoded, "unsupported"
+        reasons = [f"unsupported_encoding={encoding}"]
+    else:  # unknown
+        body, status = encoded, "unknown_encoding"
+        reasons = ["unknown_encoding"]
+    text_dv = to_text(body if body is not None else b"")
+    status = aggregate_status([status, text_dv["status"]])
+    return {
+        "index": index,
+        "content_type": part.get_content_type(),
+        "encoding": encoding,
+        "text": text_dv["value"],
+        "bytes_b64": b64(encoded),
+        "status": status,
+        "reasons": reasons + text_dv["reasons"],
+    }
+
+
+def mime_decode(data, limit):
+    """Bóc tách MIME rồi giải Base64/QP theo từng phần (F6) → DecodedValue `mime`.
+
+    `email.message_from_bytes(policy=compat32)` KHÔNG ném với thư hỏng, ghi khuyết
+    điểm vào `.defects`. Thiếu dòng trống ngăn header/body → MissingHeaderBody
+    SeparatorDefect → `deferred_to_flow`: không đoán encoding ở mức packet, để bước
+    giải mã mức flow (REQ-40) lo (REQ-23.5). `.walk()` cho cả thư nhiều phần.
+    """
+    if len(data) > limit:
+        return _over_limit(data, limit)
+    msg = email.message_from_bytes(data, policy=email.policy.compat32)
+    defects = [type(d).__name__ for d in msg.defects]
+    parts = []
+    for index, part in enumerate(_leaf_parts(msg)):
+        parts.append(_decode_part(index, part, limit))
+        defects += [type(d).__name__ for d in part.defects]
+
+    reasons = []
+    if "MissingHeaderBodySeparatorDefect" in defects:
+        status = "deferred_to_flow"
+        reasons.append("missing_header_body_separator")
+    else:
+        status = aggregate_status([p["status"] for p in parts])
+    mime_obj = {
+        "headers": [[name, value] for name, value in msg.items()],
+        "encoding": msg.get("Content-Transfer-Encoding"),
+        "parts": parts,
+        "defects": list(dict.fromkeys(defects)),       # bỏ trùng, giữ thứ tự
+    }
+    return decoded(mime_obj, "F6", status, reasons)
