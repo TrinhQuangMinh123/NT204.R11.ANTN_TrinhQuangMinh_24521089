@@ -96,6 +96,40 @@ def test_f6_mime_base64():
     assert d["status"] == "ok"
 
 
+def test_f6_strips_data_command_and_end_marker():
+    """Client gộp lệnh DATA + thư vào một segment (pipelining) — T4.4."""
+    payload = (b"DATA\r\n"
+               b"Subject: hi\r\n"
+               b"Content-Type: text/plain\r\n"
+               b"Content-Transfer-Encoding: base64\r\n\r\n"
+               b"SGVsbG8gd29ybGQ=\r\n.\r\n")
+    d = run(smtp_event(payload))
+    assert d["mime"]["rule"] == "F6"
+    assert ["Subject", "hi"] in [list(h) for h in d["mime"]["value"]["headers"]]
+    assert d["mime"]["value"]["parts"][0]["text"] == "Hello world"
+    assert d["mime"]["value"]["parts"][0]["status"] == "ok"
+    assert d["mime"]["status"] == "ok"
+
+
+def test_f6_removes_dot_stuffing():
+    """Dòng nội dung bắt đầu bằng "." được người gửi nhân đôi (RFC 5321 §4.5.2)."""
+    payload = (b"DATA\r\n"
+               b"Content-Type: text/plain\r\n\r\n"
+               b"line one\r\n"
+               b"..hidden\r\n"
+               b".\r\n")
+    d = run(smtp_event(payload))
+    assert d["mime"]["value"]["parts"][0]["text"] == "line one\r\n.hidden"
+
+
+def test_f6_without_end_marker_keeps_payload():
+    """Thư bị cắt giữa: không có dấu kết thúc thì giữ nguyên phần đã thấy."""
+    payload = (b"Content-Type: text/plain\r\n"
+               b"Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=")
+    d = run(smtp_event(payload))
+    assert d["mime"]["value"]["parts"][0]["text"] == "Hello"
+
+
 def test_f6_skips_smtp_command_packet():
     d = run(smtp_event(b"MAIL FROM:<a@b.test>\r\n"))
     assert d["mime"]["value"] is None             # không có header MIME -> không áp

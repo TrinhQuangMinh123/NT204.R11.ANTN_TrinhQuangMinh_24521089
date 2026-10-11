@@ -25,6 +25,7 @@ from .codecs import (
     percent_decode,
     to_text,
 )
+from .reassembly import MailBuffer
 
 # Năm khoá con của event["decode"], đúng §5.2 — thứ tự để tổng hợp status.
 _FIELDS = ("uri", "query", "body_form", "body_text", "mime")
@@ -34,6 +35,9 @@ _FIELDS = ("uri", "query", "body_form", "body_text", "mime")
 _MIME_HEADER_RE = re.compile(
     rb"(?im)^(?:content-type|content-transfer-encoding|mime-version)[ \t]*:"
 )
+
+# Dòng lệnh mở đầu pha DATA (RFC 5321 §4.1.1.4): mọi byte sau nó là nội dung thư.
+_DATA_LINE = b"DATA\r\n"
 
 
 def _http_app(event):
@@ -124,6 +128,35 @@ def _decode_body_text(event, limit):
     return decoded(ent["value"], "F5", status, text["reasons"] + ent["reasons"])
 
 
+def _smtp_mail_body(payload, limit):
+    """Bóc nội dung thư ra khỏi khung SMTP trước khi parse MIME (REQ-23.1).
+
+    Hai thứ của giao thức, không phải của thư, phải bỏ đi:
+      - dòng lệnh `DATA\r\n` khi client gộp lệnh và thư vào CÙNG một segment
+        (client pipelining — không chờ reply `354`). Không bỏ thì dòng đó không
+        có dấu `:` nên `email` coi cả khối là body: `headers` rỗng, encoding
+        `null`, body không được giải mã (đo 2026-10-11).
+      - dấu kết thúc `\r\n.\r\n` và dot-stuffing (RFC 5321 §4.5.2). Không bỏ thì
+        dấu chấm cuối lọt vào body Base64 → `binascii` báo "Excess data after
+        padding" và cả thư ra `invalid` dù nội dung đúng.
+
+    Dùng LẠI `MailBuffer` của REQ-40 chứ không viết lại: định nghĩa "thế nào là
+    hết một thư" phải có đúng một chỗ, nếu không mức packet và mức flow sẽ cắt
+    thư khác nhau.
+    """
+    at = payload.find(_DATA_LINE)
+    if at == 0 or (at > 0 and payload[at - 1] == 0x0A):
+        payload = payload[at + len(_DATA_LINE):]
+    buffer = MailBuffer(limit)
+    mails = buffer.feed(payload)
+    if mails:
+        return mails[0]
+    rest = buffer.flush()
+    # Không thấy dấu kết thúc: trả nguyên phần đã có để mime_decode tự kết luận
+    # (thiếu dòng trống → deferred_to_flow, REQ-23.5).
+    return rest[0] if rest else payload
+
+
 def _decode_mime(event, limit):
     """F6: payload SMTP có header MIME → bóc tách + giải Base64/QP ở mức packet.
 
@@ -138,7 +171,9 @@ def _decode_mime(event, limit):
     payload = base64.b64decode(tcp["payload_b64"])
     if not _MIME_HEADER_RE.search(payload):
         return None
-    return mime_decode(payload, limit)
+    if len(payload) > limit:
+        return mime_decode(payload, limit)      # giữ nguyên ca vượt giới hạn
+    return mime_decode(_smtp_mail_body(payload, limit), limit)
 
 
 # Bảng tra Phụ lục F: (khoá đích, hàm decode). Thứ tự khớp _FIELDS.
