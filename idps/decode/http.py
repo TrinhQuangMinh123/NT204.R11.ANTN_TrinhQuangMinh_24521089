@@ -156,29 +156,46 @@ def _parse_headers(raw_lines: list, fields: dict) -> str | None:
     dòng Content-Length khác nhau là một tín hiệu tấn công — dict sẽ ghi đè và
     xoá đúng bằng chứng đó. Thứ tự cũng được giữ vì nó là dữ liệu nhận dạng
     client (fingerprint).
+
+    Dòng sai cú pháp thì GHI LÝ DO rồi BỎ QUA DÒNG ĐÓ và đọc tiếp các dòng sau
+    (sửa 2026-10-11 — xem `NOTES.md`). Bản đầu dừng hẳn tại dòng sai, và đó là
+    một lỗ né luật: kẻ tấn công nhồi một byte rác vào một dòng sớm thì mọi dòng
+    phía dưới biến mất khỏi event, trong khi máy chủ thật nhiều khi vẫn nhận
+    (RFC 9110 §5.5 coi byte > 0x7F trong field value là obs-text: không khuyến
+    khích nhưng không bắt từ chối). IDS thấy ít hơn bên nhận là đúng định nghĩa
+    của một đường né. Đọc tiếp thì rủi ro đổi chiều — ta có thể thấy NHIỀU hơn
+    bên nhận — nhưng hướng đó chỉ sinh báo động thừa, không sinh bỏ sót.
+
+    Dòng sai không được ghép vào `headers`: ta không đoán hộ bên nhận hiểu nó
+    thế nào. Bytes nguyên văn vẫn ở `payload_b64` của event (I-4) nên luật quét
+    byte thô vẫn soi lại được. Nhiều dòng sai -> các lý do nối bằng "; ".
     """
+    reasons = []
     for number, raw in enumerate(raw_lines, start=2):   # dòng 1 là start line
         try:
             line = _decode_line(raw)
         except UnicodeDecodeError as exc:
             # REQ-7.5. Ghi số dòng và vị trí byte để soi lại bằng xxd được ngay.
-            return (f"http header line {number} cannot decode as ascii: "
-                    f"byte 0x{raw[exc.start]:02x} at offset {exc.start}")
+            reasons.append(f"http header line {number} cannot decode as ascii: "
+                           f"byte 0x{raw[exc.start]:02x} at offset {exc.start}")
+            continue
 
         name, separator, value = line.partition(":")
         if not separator:
             # Không có dấu ":" -> hoặc là obs-fold (dòng nối, đã bỏ từ RFC 7230),
             # hoặc là rác. Cả hai đều là chỗ hai bên nhận có thể hiểu khác nhau.
-            return f"http header line {number} has no colon: {line!r}"
+            reasons.append(f"http header line {number} has no colon: {line!r}")
+            continue
         if not name or name.strip(OWS) != name:
             # Tên rỗng, hoặc có khoảng trắng quanh dấu ":" — RFC 9112 §5.1 buộc
             # TỪ CHỐI, vì proxy cắt khoảng trắng còn server thì không (hoặc
             # ngược lại) là cách tạo ra hai cách đọc cho cùng một message.
-            return (f"http header line {number} has an invalid field name "
-                    f"{name!r} (empty, folded, or padded with whitespace)")
+            reasons.append(f"http header line {number} has an invalid field name "
+                           f"{name!r} (empty, folded, or padded with whitespace)")
+            continue
         # Giá trị: cắt OWS hai đầu (không phải dữ liệu). Tên: nguyên văn.
         fields["headers"].append([name, value.strip(OWS)])
-    return None
+    return "; ".join(reasons) if reasons else None
 
 
 def parse_http(payload: bytes) -> ParseResult:

@@ -276,12 +276,32 @@ def test_non_ascii_byte_in_a_header_reports_a_decode_error():
     assert result.fields["headers"] == [["Host", "10.20.0.10"]]
 
 
-def test_decode_error_stops_at_the_bad_line():
-    """Dừng tại dòng sai, không đọc tiếp: đọc tiếp = tự đoán bên kia hiểu sao."""
+def test_decode_error_skips_the_bad_line_but_keeps_reading():
+    """Sửa 2026-10-11: dừng hẳn tại dòng sai là một đường né luật (NOTES.md).
+
+    Kẻ tấn công nhồi một byte rác vào dòng sớm rồi giấu thứ cần giấu bên dưới;
+    máy chủ thật nhiều khi vẫn nhận, nên IDS không được phép thấy ít hơn nó.
+    """
     payload = (b"GET / HTTP/1.1\r\nA: 1\r\nB: \xff\r\nC: 3\r\n\r\n")
     result = parse_http(payload)
     assert result.error is not None and "line 3" in result.error
-    assert result.fields["headers"] == [["A", "1"]]
+    assert result.fields["headers"] == [["A", "1"], ["C", "3"]]   # dòng sau CÒN
+
+
+def test_every_bad_header_line_is_reported():
+    """Nhiều dòng sai -> mọi lý do đều có trong error, nối bằng "; "."""
+    payload = b"GET / HTTP/1.1\r\nA: 1\r\nrubbish\r\nB: \xff\r\nC: 3\r\n\r\n"
+    result = parse_http(payload)
+    assert "line 3 has no colon" in result.error
+    assert "line 4 cannot decode as ascii" in result.error
+    assert result.fields["headers"] == [["A", "1"], ["C", "3"]]
+
+
+def test_header_hidden_after_a_bad_line_is_still_parsed():
+    """Ca né luật cụ thể: Host thật bị giấu dưới một dòng rác."""
+    payload = b"GET / HTTP/1.1\r\nX: \xff\r\nHost: victim.lab\r\n\r\n"
+    result = parse_http(payload)
+    assert ["Host", "victim.lab"] in result.fields["headers"]
 
 
 def test_non_ascii_byte_in_the_start_line():
