@@ -248,3 +248,11 @@ def test_status_and_action_use_fixed_vocabulary():
         pp = run(event)
         assert pp["status"] in VALUES_STATUS
         assert pp["action"] in VALUES_ACTION
+
+
+def test_path_traversal_continues_even_under_skip():
+    # Traversal là bằng chứng tấn công, không phải dữ liệu thiếu (REQ-27.6).
+    keep = Preprocessor(SKIP_CFG).process(ev := http_event(uri="/../etc"))
+    assert ev["preprocess"]["status"] == "partial"
+    assert ev["preprocess"]["action"] == "marked"
+    assert keep is True

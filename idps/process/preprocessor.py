@@ -230,9 +230,10 @@ class Preprocessor(Stage):
             return True
 
         pp["status"] = "partial"
-        # policy `skip` chỉ áp cho dữ liệu THIẾU; proto UNKNOWN (unsupported) vẫn
-        # phải xuống Flow Tracker vì là bằng chứng port scan (REQ-28.4).
-        missing_data = any(not reason.startswith("unsupported") for reason in reasons)
+        # policy `skip` chỉ áp cho dữ liệu THIẾU/không đọc trọn (bài 1 đánh dấu
+        # upstream_status). `unsupported` (REQ-28.4) và path_traversal (REQ-27.6) là
+        # bằng chứng tấn công với 5-tuple đủ -> vẫn phải xuống Flow Tracker.
+        missing_data = any(reason.startswith("upstream_status") for reason in reasons)
         if missing_data and self.config["missing_data_policy"] == "skip":
             pp["action"] = "skipped"
             return False
