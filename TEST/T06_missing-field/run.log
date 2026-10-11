@@ -1,0 +1,4 @@
+config={"max_active_flows":10000,"max_decode_bytes":65536,"max_reassembly_bytes":1048576,"max_reassembly_total_bytes":16777216,"missing_data_policy":"mark","tcp.closed":120,"tcp.established":3600,"tcp.new":60,"udp.established":300,"udp.new":30}
+processed=10 unknown=0 malformed=10
+flows_created=3 flows_closed=3 close.end_of_run=3 decode_errors=0 preprocess_errors=0 flow_errors=0
+exit=0
