@@ -611,3 +611,30 @@ def test_end_of_run_flushes_in_creation_order():
     tracker.close()
     assert [r["flow_id"] for r in sink.records] == [1, 2, 3]
     assert {r["close_reason"] for r in sink.records} == {"end_of_run"}
+
+
+def test_extra_flow_sink():
+    # REQ-35.4: MỌI sink đã đăng ký đều nhận record, không riêng bộ ghi tệp.
+    first, extra = RecordingSink(), RecordingSink()
+    tracker = FlowTracker(LIMITS, [first, extra])
+    tracker.process(tcp_event(A, 5000, B, 80, ["SYN"], ts=0))
+    tracker.close()
+    assert len(first.records) == len(extra.records) == 1
+    assert first.records[0] == extra.records[0]
+    assert first.closed and extra.closed
+
+
+def test_stage_error_counts_per_stage():
+    # Đếm ngoại lệ bất ngờ theo tên stage — nguồn của decode_errors/flow_errors.
+    from idps.process.chain import ProcessingChain, Stage
+
+    class Boom(Stage):
+        name = "flow"
+
+        def process(self, event):
+            raise RuntimeError("bug")
+
+    chain = ProcessingChain([Boom()])
+    chain.handle(make_event(A, 5000, B, 80))
+    chain.handle(make_event(A, 5000, B, 80))
+    assert chain.error_counts == {"flow": 2}

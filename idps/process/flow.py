@@ -28,6 +28,9 @@ _UDP_IDLE_ONE_WAY = ("udp.new", "idle_new")
 _UDP_IDLE_BOTH_WAYS = ("udp.established", "idle_established")
 _USEC_PER_SEC = 1_000_000
 
+# Thứ tự cố định của close_reason (Phụ lục H) — để dòng thống kê tất định.
+CLOSE_REASONS = ("idle_new", "idle_established", "idle_closed", "table_full", "end_of_run")
+
 # Phiên bản schema của flow record — bộ đếm RIÊNG, không dùng chung với event (35.3).
 FLOW_SCHEMA_VERSION = 1
 _FLAG_COUNTERS = (("SYN", "syn_count"), ("ACK", "ack_count"),
@@ -341,6 +344,7 @@ class FlowTracker(Stage):
         self.table = FlowTable()
         self._next_flow_id = 1
         self.clock_usec = 0                  # "bây giờ" = timestamp packet, đơn điệu tăng
+        self.closed_by_reason = {}           # close_reason -> số flow (dòng thống kê)
 
     def process(self, event):
         src, dst, protocol, problem = _endpoints(event)
@@ -369,6 +373,11 @@ class FlowTracker(Stage):
         event["flow"]["state"] = flow.state     # trạng thái SAU khi tính packet này
         return True
 
+    @property
+    def flows_created(self):
+        """Số flow đã tạo = flow_id lớn nhất đã cấp (ADR-22), nên tự đối chiếu được."""
+        return self._next_flow_id - 1
+
     def _advance_clock(self, event):
         """`now = max(now, ts)`: lấy từ packet, không từ giờ hệ thống (REQ-33.2).
 
@@ -385,6 +394,7 @@ class FlowTracker(Stage):
         Hết hạn là lúc *sinh ra* bằng chứng, không phải lúc xoá nó (REQ-33.1b).
         """
         record = flow.to_record(self.clock_usec, reason)
+        self.closed_by_reason[reason] = self.closed_by_reason.get(reason, 0) + 1
         for sink in self.flow_sinks:
             sink.handle(record)
         self.table.remove(flow)

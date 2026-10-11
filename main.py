@@ -21,6 +21,7 @@ from idps.output.jsonl import JsonlWriter
 from idps.process.chain import ProcessingChain
 from idps.process.config import Config, ConfigError
 from idps.process.decoder import Decoder
+from idps.process.flow import CLOSE_REASONS, FlowTracker
 from idps.process.preprocessor import Preprocessor
 
 PROG = "main.py"
@@ -76,15 +77,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_sinks(args, config) -> list:
+def build_chain(config, flow_sinks):
+    """Chuỗi stage của bài 2 + tracker (để main đọc thống kê của nó).
+
+    Thứ tự Decoder → Preprocessor → FlowTracker là C-17: Flow Tracker chỉ nhận event
+    đã giải mã và chuẩn hoá. FlowTracker nhận `flow_sinks` — vòng đời của chúng
+    thuộc tracker (nó xả flow còn lại rồi mới đóng chúng, ADR-25).
+    """
+    tracker = FlowTracker(config, flow_sinks)
+    return ProcessingChain([Decoder(config), Preprocessor(config), tracker]), tracker
+
+
+def build_sinks(args, chain) -> list:
     """Các module phía sau của lần chạy này, theo thứ tự nhận event (REQ-20.1).
 
-    Bài 2: chuỗi stage (Decoder → Preprocessor → FlowTracker) gói trong MỘT
     `ProcessingChain` đứng TRƯỚC bộ ghi event, nên event chỉ được ghi SAU khi đã
-    đi qua các stage (ADR-17). Phase 2 có Decoder → Preprocessor; FlowTracker nối
-    vào đúng danh sách này ở Phase 3. Runner, JsonlWriter của bài 1 không đổi.
+    đi qua các stage (ADR-17). Runner, JsonlWriter của bài 1 không đổi.
     """
-    chain = ProcessingChain([Decoder(config), Preprocessor(config)])
     return [chain, JsonlWriter(args.output)]
 
 
@@ -94,11 +103,27 @@ def build_flow_sinks(args) -> list:
     Dùng lại chính JsonlWriter của bài 1: hợp đồng của nó là "một dict → một dòng
     JSON + flush", không đọc khoá nào của event, nên ghi flow record y nguyên.
     Danh sách này KHÔNG nằm trong `sinks` của Runner — nếu nằm, Runner sẽ gọi
-    handle() với *event* và ghi sai schema vào flows.jsonl (ADR-25). Vòng đời của
-    nó thuộc FlowTracker (nối ở phase sau); bài này mở để tạo tệp và kiểm ghi
-    được (REQ-35.7), rồi main đóng ở cuối.
+    handle() với *event* và ghi sai schema vào flows.jsonl (ADR-25).
     """
     return [JsonlWriter(args.flow_output)]
+
+
+def flow_stats_line(chain, tracker) -> str:
+    """Dòng thống kê thứ hai (REQ-35.5, design §5.5), cùng kiểu `khoá=giá trị`.
+
+    Chỉ in lý do đóng có xuất hiện, theo thứ tự cố định của Phụ lục H. Ba số lỗi là
+    số ngoại lệ bất ngờ của từng stage — bộ dữ liệu hỏng vẫn phải ra 0 (NFR-10),
+    vì lỗi dự kiến là dữ liệu chứ không phải ngoại lệ.
+    """
+    closed = tracker.closed_by_reason
+    parts = [f"flows_created={tracker.flows_created}",
+             f"flows_closed={sum(closed.values())}"]
+    parts += [f"close.{reason}={closed[reason]}" for reason in CLOSE_REASONS if reason in closed]
+    errors = chain.error_counts
+    parts += [f"decode_errors={errors.get('decoder', 0)}",
+              f"preprocess_errors={errors.get('preprocessor', 0)}",
+              f"flow_errors={errors.get('flow', 0)}"]
+    return " ".join(parts)
 
 
 def parse_overrides(raw_list, parser):
@@ -209,27 +234,27 @@ def main(argv=None) -> int:
     except ConfigError as exc:
         return fail(str(exc))
 
-    # Sink + flow writer TRƯỚC nguồn (REQ-13.4, 20.4, 35.7, §8.2): chạy live 10
+    # Flow writer + sink TRƯỚC nguồn (REQ-13.4, 20.4, 35.7, §8.2): chạy live 10
     # phút rồi mới phát hiện không ghi được file là mất trắng. Bắt Exception chứ
     # không chỉ OSError vì module bài sau có thể mở tài nguyên khác.
     try:
-        sinks = build_sinks(args, config)
+        flow_sinks = build_flow_sinks(args)
     except Exception as exc:  # noqa: BLE001 - lỗi khởi động của module phía sau
         return fail(f"cannot open output: {exc}")
+    chain, tracker = build_chain(config, flow_sinks)
     try:
-        flow_sinks = build_flow_sinks(args)
+        sinks = build_sinks(args, chain)
     except Exception as exc:  # noqa: BLE001
-        for sink in sinks:
+        for sink in flow_sinks:
             sink.close()
         return fail(f"cannot open output: {exc}")
 
     try:
         source = build_source(args)
     except SourceError as exc:
-        # Sink đã mở ở trên -> phải tự đóng, vì chưa có Runner nào lo hộ.
+        # Sink đã mở ở trên -> phải tự đóng, vì chưa có Runner nào lo hộ. Đóng
+        # chain cũng đóng flow_sinks (tracker.close, chưa có flow nào để xả).
         for sink in sinks:
-            sink.close()
-        for sink in flow_sinks:
             sink.close()
         return fail(str(exc))
 
@@ -238,24 +263,20 @@ def main(argv=None) -> int:
     # hỏng trước khi có frame nào (giữ hành vi stdout rỗng của bài 1).
     runner = Runner(_ConfigEchoSource(source, config), sinks, process_frame)
     try:
-        try:
-            stats = runner.run()
-        except KeyboardInterrupt:
-            # Dừng theo yêu cầu người dùng = kết thúc bình thường (REQ-1.6): sink
-            # đã được Runner đóng trong finally, chỉ còn in thống kê rồi exit 0.
-            stats = runner.stats
-        except SourceError as exc:
-            # Nguồn hỏng giữa chừng (vd global header cụt): Runner đã đóng sink.
-            return fail(str(exc))
-    finally:
-        # flow_sinks không thuộc Runner (ADR-25) -> main tự đóng, luôn luôn, kể cả
-        # khi nguồn hỏng giữa chừng. Phase sau FlowTracker xả flow trước bước này.
-        for sink in flow_sinks:
-            sink.close()
+        stats = runner.run()
+    except KeyboardInterrupt:
+        # Dừng theo yêu cầu người dùng = kết thúc bình thường (REQ-1.6): sink
+        # đã được Runner đóng trong finally, chỉ còn in thống kê rồi exit 0.
+        stats = runner.stats
+    except SourceError as exc:
+        # Nguồn hỏng giữa chừng (vd global header cụt): Runner đã đóng sink.
+        return fail(str(exc))
 
-    # REQ-13.5 + REQ-20.3: in SAU khi mọi sink đã đóng, nên con số trong dòng
-    # này luôn khớp với số dòng đã nằm trong file.
+    # REQ-13.5 + REQ-20.3: in SAU khi mọi sink đã đóng — kể cả flow sink, do
+    # tracker.close() xả flow còn lại rồi đóng chúng — nên con số trong các dòng
+    # này luôn khớp với số dòng đã nằm trong file. Dòng bài 1 giữ nguyên từng ký tự.
     print(stats.line())
+    print(flow_stats_line(chain, tracker))
     return EXIT_OK
 
 

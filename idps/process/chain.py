@@ -65,6 +65,9 @@ class ProcessingChain(EventSink):
     def __init__(self, stages):
         # Chụp lại danh sách để người gọi sửa list của họ sau đó không đổi hành vi.
         self.stages = list(stages)
+        # Số ngoại lệ bất ngờ theo tên stage — nguồn của dòng thống kê thứ hai
+        # (`decode_errors`/`preprocess_errors`/`flow_errors`, REQ-35.5, NFR-10).
+        self.error_counts = {}
 
     def handle(self, event: dict) -> None:
         """Chạy từng stage; dừng khi một stage trả False hoặc ném (I-11).
@@ -79,6 +82,8 @@ class ProcessingChain(EventSink):
                 keep = stage.process(event)
             except Exception as exc:  # noqa: BLE001 — lưới cho bug, không cho dữ liệu
                 _record_error(event, stage, exc)
+                name = getattr(stage, "name", "stage")
+                self.error_counts[name] = self.error_counts.get(name, 0) + 1
                 return
             if not keep:
                 return

@@ -216,11 +216,12 @@ def test_stats_line(tmp_path):
     out = tmp_path / "out.jsonl"
     result = run_cli("--pcap", src, "-o", out)
     assert result.returncode == 0
-    # Bài 2 thêm một dòng config trước packet đầu tiên (REQ-36.4); dòng thống kê
-    # của bài 1 vẫn là dòng cuối, giữ nguyên từng ký tự (design §5.5).
+    # Bài 2 thêm một dòng config trước packet đầu tiên (REQ-36.4) và một dòng thống
+    # kê flow SAU dòng của bài 1, dòng đó giữ nguyên từng ký tự (design §5.5).
     lines = result.stdout.splitlines()
     assert lines[0].startswith("config=")
-    assert lines[-1] == "processed=3 unknown=1 malformed=1"
+    assert lines[-2] == "processed=3 unknown=1 malformed=1"
+    assert lines[-1].startswith("flows_created=")
 
 
 def test_one_line_per_packet(tmp_path):
@@ -253,7 +254,10 @@ def test_empty_pcap_still_exits_zero(tmp_path):
     out = tmp_path / "out.jsonl"
     result = run_cli("--pcap", src, "-o", out)
     assert result.returncode == 0
-    assert result.stdout.strip() == "processed=0 unknown=0 malformed=0"
+    assert result.stdout.splitlines() == [
+        "processed=0 unknown=0 malformed=0",
+        "flows_created=0 flows_closed=0 decode_errors=0 preprocess_errors=0 flow_errors=0",
+    ]
     assert out.read_bytes() == b""
 
 
@@ -268,7 +272,7 @@ def test_truncated_record_does_not_stop_the_run(tmp_path):
     assert events[1]["errors"] == [{"layer": "capture", "reason": "truncated record"}]
     lines = result.stdout.splitlines()
     assert lines[0].startswith("config=")          # config echo (REQ-36.4)
-    assert lines[-1] == "processed=2 unknown=0 malformed=1"
+    assert lines[-2] == "processed=2 unknown=0 malformed=1"
 
 
 def test_stats_line_matches_the_file(tmp_path):
@@ -278,3 +282,56 @@ def test_stats_line_matches_the_file(tmp_path):
     result = run_cli("--pcap", src, "-o", out)
     processed = int(result.stdout.split("processed=")[1].split()[0])
     assert processed == len(lines_of(out))
+
+
+# --- T3.6 flow record: tệp, dòng thống kê thứ hai, lỗi ghi ------------------
+
+def test_flow_output_and_second_stats_line(tmp_path):
+    src = write_pcap(tmp_path / "in.pcap", [IPV4_STUB, ARP, IPV4_STUB])
+    out, flows = tmp_path / "out.jsonl", tmp_path / "flows.jsonl"
+    result = run_cli("--pcap", src, "-o", out, "--flow-output", flows)
+    assert result.returncode == 0
+    records = [json.loads(line) for line in lines_of(flows)]
+    assert len(records) == 1 and records[0]["schema_version"] == 1   # schema riêng của flow
+    assert records[0]["packet_count"] == 2 and records[0]["close_reason"] == "end_of_run"
+    assert "packet_id" not in records[0]                             # không phải event
+    assert sum(1 for line in result.stdout.splitlines() if line.startswith("processed=")) == 1
+    assert result.stdout.splitlines()[-1] == (
+        "flows_created=1 flows_closed=1 close.end_of_run=1 "
+        "decode_errors=0 preprocess_errors=0 flow_errors=0")
+
+
+def test_flow_stats_line_matches_the_file(tmp_path):
+    src = write_pcap(tmp_path / "in.pcap", [IPV4_STUB] * 3)
+    flows = tmp_path / "flows.jsonl"
+    result = run_cli("--pcap", src, "-o", tmp_path / "o.jsonl", "--flow-output", flows)
+    created = int(result.stdout.split("flows_created=")[1].split()[0])
+    assert created == len(lines_of(flows))
+
+
+def test_default_flow_output(tmp_path):
+    src = write_pcap(tmp_path / "in.pcap", [IPV4_STUB])
+    assert run_cli("--pcap", src, cwd=tmp_path).returncode == 0
+    assert len(lines_of(tmp_path / "flows.jsonl")) == 1
+
+
+def test_unwritable_flow_output(tmp_path):
+    src = write_pcap(tmp_path / "in.pcap", [IPV4_STUB])
+    result = run_cli("--pcap", src, "-o", tmp_path / "o.jsonl",
+                     "--flow-output", tmp_path)                  # thư mục, không ghi được
+    assert result.returncode == 1
+    assert "cannot open output" in result.stderr
+    assert "processed=" not in result.stdout and "config=" not in result.stdout
+
+
+def test_flow_stats_line_unit():
+    class Tracker:
+        flows_created = 5
+        closed_by_reason = {"end_of_run": 1, "idle_new": 4}      # thứ tự chèn khác Phụ lục H
+
+    class Chain:
+        error_counts = {"flow": 2}
+
+    assert cli.flow_stats_line(Chain, Tracker) == (
+        "flows_created=5 flows_closed=5 close.idle_new=4 close.end_of_run=1 "
+        "decode_errors=0 preprocess_errors=0 flow_errors=2")
