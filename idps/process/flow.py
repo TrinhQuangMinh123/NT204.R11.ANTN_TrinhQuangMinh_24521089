@@ -4,11 +4,15 @@ Một *flow* là mọi packet của cùng một phiên, cả hai chiều. Detect
 đơn vị này vì dấu hiệu tấn công (SYN không được trả lời, tỉ lệ gửi/nhận) chỉ thấy
 được khi gom nhiều packet lại.
 
-File này đọc event từ khoá đã chuẩn hoá của Preprocessor và KHÔNG import gì ngoài
-`.chain` — đối tượng thư viện không lọt sang tầng phát hiện (đề bài §6, I-20).
+File này đọc event từ khoá đã chuẩn hoá của Preprocessor và chỉ import module cùng
+package `process/` — đối tượng thư viện không lọt sang tầng phát hiện (đề bài §6, I-20).
 """
+import base64
+
 from ..core.event import format_timestamp
 from .chain import Stage
+from .codecs import aggregate_status, mime_decode
+from .reassembly import MailBuffer
 
 _PROTOCOLS = ("TCP", "UDP")
 
@@ -27,6 +31,11 @@ _TCP_IDLE = {
 _UDP_IDLE_ONE_WAY = ("udp.new", "idle_new")
 _UDP_IDLE_BOTH_WAYS = ("udp.established", "idle_established")
 _USEC_PER_SEC = 1_000_000
+
+# Lỗi tầng nào của một packet cho thấy byte trong flow có thể đã mất (REQ-40.7):
+# `truncated` của bài 1 cũng được ghi thành lỗi tầng `capture`.
+_GAP_LAYERS = ("capture", "tcp")
+_SMTP_DATA_ACCEPTED = 354
 
 # Thứ tự cố định của close_reason (Phụ lục H) — để dòng thống kê tất định.
 CLOSE_REASONS = ("idle_new", "idle_established", "idle_closed", "table_full", "end_of_run")
@@ -99,6 +108,14 @@ class Flow:
         self.flag_counts = {name: 0 for _, name in _FLAG_COUNTERS}
         self.application_protocol = None
         self.notes = []                # ghi chú mức flow, vào `reasons` của record
+        # --- gom thư SMTP (REQ-40, ADR-26) — chỉ dùng khi flow là SMTP ---
+        self.mails = []                # DecodedValue rule F8, vào `mails` của record
+        self.pending_data = None       # chiều của lệnh DATA đang chờ reply 354
+        self.mail_direction = None     # chiều gửi thư khi đang trong pha DATA
+        self.mail_buffer = None        # MailBuffer; None = không ở trong pha DATA
+        self.mail_bytes = 0            # tổng byte các thư đã gom: phần ngân sách đã dùng
+        self.mail_gap = False          # đã thấy dấu hiệu mất byte trong pha DATA này
+        self.mail_stopped = False      # chạm max_reassembly_bytes: không gom thêm thư nào
         self.close_reason = None       # FlowTable.expire / FlowTracker đặt lúc đóng
 
     def idle_rule(self):
@@ -199,7 +216,7 @@ class Flow:
         """Dựng flow record: ĐÚNG tập khoá design §5.3, chỉ chứa kiểu JSON (I-13).
 
         Dựng từ giá trị đã chốt, không tham chiếu ngược event — record là bản chốt
-        sổ của flow chứ không phải một event (C-18). Khoá `mails` rỗng tới Phase 4.
+        sổ của flow chứ không phải một event (C-18).
         """
         reasons = list(self.notes)
         if self.malformed_packets:
@@ -233,7 +250,7 @@ class Flow:
             "state": self.state,
             "midstream": self.midstream if is_tcp else None,
             "close_reason": close_reason,
-            "mails": [],
+            "mails": self.mails,
             "reasons": reasons,
         }
 
@@ -371,6 +388,7 @@ class FlowTracker(Stage):
         flow.update(event, direction)
         event["flow"]["direction"] = direction
         event["flow"]["state"] = flow.state     # trạng thái SAU khi tính packet này
+        self._observe_mail(flow, event, direction)
         return True
 
     @property
@@ -393,6 +411,7 @@ class FlowTracker(Stage):
 
         Hết hạn là lúc *sinh ra* bằng chứng, không phải lúc xoá nó (REQ-33.1b).
         """
+        self._finish_mail(flow)
         record = flow.to_record(self.clock_usec, reason)
         self.closed_by_reason[reason] = self.closed_by_reason.get(reason, 0) + 1
         for sink in self.flow_sinks:
@@ -408,3 +427,102 @@ class FlowTracker(Stage):
             self._close(flow, "end_of_run")
         for sink in self.flow_sinks:
             sink.close()
+
+    # --- gom thư SMTP ở mức flow (REQ-40, ADR-26) --------------------------
+
+    def _observe_mail(self, flow, event, direction):
+        if flow.mail_buffer is None:
+            self._look_for_data_phase(flow, event, direction)
+        elif direction == flow.mail_direction:
+            self._collect_mail(flow, event)
+
+    def _look_for_data_phase(self, flow, event, direction):
+        """Vào pha DATA khi thấy lệnh `DATA` rồi reply `354` từ chiều NGƯỢC (ADR-26).
+
+        Cần cả hai: lệnh `DATA` mới chỉ là lời xin, server từ chối (503…) thì sau
+        đó không có thư nào. Lệnh khác của cùng bên gửi huỷ lời xin đang chờ.
+        """
+        if flow.mail_stopped or event["preprocess"].get("app_proto") != "SMTP":
+            return
+        app = event.get("app") or {}
+        if app.get("kind") == "command":
+            flow.pending_data = direction if app.get("command") == "DATA" else None
+        elif (app.get("kind") == "response" and flow.pending_data is not None
+              and direction != flow.pending_data
+              and app.get("status_code") == _SMTP_DATA_ACCEPTED):
+            self._enter_data_phase(flow, flow.pending_data)
+
+    def _enter_data_phase(self, flow, mail_direction):
+        flow.pending_data = None
+        limit = self.config["max_reassembly_bytes"]
+        # Ngân sách là của CẢ flow: các thư đã gom trước đó đã ăn một phần (REQ-40.4).
+        room = limit - flow.mail_bytes
+        if room <= 0:
+            flow.mail_stopped = True
+            self._note(flow, f"reassembly_limit={limit}")
+            return
+        flow.mail_buffer = MailBuffer(room)
+        flow.mail_direction = mail_direction
+        flow.mail_gap = False
+
+    def _collect_mail(self, flow, event):
+        """Nối payload (đọc từ `tcp.payload_b64`, không từ `app`) vào bộ đệm của flow.
+
+        Parser SMTP của bài 1 không parse nội dung thư, nên bộ đệm không được phụ
+        thuộc việc packet này có được nhận là SMTP hay không.
+        """
+        if any(error["layer"] in _GAP_LAYERS for error in event["errors"]):
+            flow.mail_gap = True
+        payload = base64.b64decode(((event.get("tcp") or {}).get("payload_b64")) or "")
+        if not payload:
+            return
+        buffer = flow.mail_buffer
+        complete = buffer.feed(payload)
+        for raw in complete:
+            self._add_mail(flow, raw, partial=False, reasons=())
+        if buffer.stopped:
+            # Dừng gom nhưng KHÔNG bỏ phần đã có: giải mã nó, đánh dấu dở dang (REQ-40.4).
+            for raw in buffer.flush():
+                self._add_mail(flow, raw, partial=True, reasons=buffer.reasons)
+            flow.mail_stopped = True
+            for reason in buffer.reasons:
+                self._note(flow, reason)
+            self._leave_data_phase(flow)
+        elif complete:
+            self._leave_data_phase(flow)     # dấu kết thúc đóng pha; thư sau mở bộ đệm mới
+
+    def _finish_mail(self, flow):
+        """Flow rời bảng khi bộ đệm còn dữ liệu → giải mã phần đã gom (REQ-40.3, 40.6)."""
+        if flow.mail_buffer is None:
+            return
+        for raw in flow.mail_buffer.flush():
+            self._add_mail(flow, raw, partial=True, reasons=("no_end_of_data_marker",))
+        self._leave_data_phase(flow)
+
+    def _leave_data_phase(self, flow):
+        flow.mail_buffer = None              # giải phóng bộ nhớ ngay (REQ-40.6)
+        flow.mail_direction = None
+        flow.mail_gap = False
+
+    def _add_mail(self, flow, raw, partial, reasons):
+        """Giải mã một thư bằng CHÍNH `mime_decode` của REQ-23 (REQ-40.8), rule F8.
+
+        `mail_bytes` cộng độ dài thư thô: là cận trên của kích thước đã giải mã
+        (Base64/QP chỉ làm nhỏ đi) nên ngân sách không bao giờ bị tính hụt.
+        """
+        flow.mail_bytes += len(raw)
+        result = mime_decode(raw, self.config["max_decode_bytes"])
+        result["rule"] = "F8"
+        result["reasons"] += list(reasons)
+        if flow.mail_gap:
+            partial = True
+            result["reasons"].append("payload_gap")
+            self._note(flow, "payload_gap")
+        if partial:
+            result["status"] = aggregate_status([result["status"], "partial"])
+        flow.mails.append(result)
+
+    @staticmethod
+    def _note(flow, reason):
+        if reason not in flow.notes:
+            flow.notes.append(reason)

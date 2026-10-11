@@ -1,7 +1,8 @@
-"""Phase 3 — Flow/Connection Tracker. Event dựng tay, không qua parser (NFR-16).
+"""Phase 3–4 — Flow/Connection Tracker. Event dựng tay, không qua parser (NFR-16).
 
-T3.1: khoá hai chiều + flow_id. Các task sau thêm test vào cuối file này.
+T3.x: flow, trạng thái, thống kê, hết hạn. T4.x (cuối file): gom thư SMTP.
 """
+import base64
 import json
 
 from idps.core.event import new_event
@@ -638,3 +639,132 @@ def test_stage_error_counts_per_stage():
     chain.handle(make_event(A, 5000, B, 80))
     chain.handle(make_event(A, 5000, B, 80))
     assert chain.error_counts == {"flow": 2}
+
+
+# --- T4.2: gom thư SMTP ở mức flow (REQ-40, ADR-26) --------------------------
+
+SMTP_MAIL = (b"Subject: hi\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+             b"SGVsbG8gd29ybGQ=\r\n")
+
+
+def smtp_packet(side, payload=b"", app=None, ts=1_000_000):
+    """Packet SMTP dựng tay: c = client A:5000 → server B:25, s = chiều ngược lại.
+
+    `app` là khoá `app` mà parser bài 1 sẽ điền (lệnh/reply); packet nội dung thư
+    không có `app` — parser không parse nội dung thư.
+    """
+    if side == "c":
+        event = tcp_event(A, 5000, B, 25, ["ACK", "PSH"], payload_len=len(payload), ts=ts)
+    else:
+        event = tcp_event(B, 25, A, 5000, ["ACK", "PSH"], payload_len=len(payload), ts=ts)
+    event["tcp"]["payload_b64"] = base64.b64encode(payload).decode("ascii")
+    event["preprocess"]["app_proto"] = "SMTP" if app else None
+    event["app"] = app
+    return event
+
+
+def command(name):
+    return {"kind": "command", "command": name, "status_code": None}
+
+
+def reply(code):
+    return {"kind": "response", "command": None, "status_code": code}
+
+
+def run_flow(packets, cfg=CFG):
+    """Đưa packet vào tracker, đóng, trả (record duy nhất, tracker)."""
+    sink = RecordingSink()
+    tracker = FlowTracker(cfg, [sink])
+    for n, packet in enumerate(packets):
+        packet["preprocess"]["ts_usec"] = 1_000_000 + n
+        tracker.process(packet)
+    tracker.close()
+    assert len(sink.records) == 1
+    return sink.records[0], tracker
+
+
+def data_session(*body, accepted=True):
+    """DATA → 354 → các packet nội dung (mỗi phần tử của `body` là một packet)."""
+    packets = [smtp_packet("c", b"DATA\r\n", command("DATA")),
+               smtp_packet("s", b"354 go ahead\r\n", reply(354 if accepted else 503))]
+    return packets + [smtp_packet("c", chunk) for chunk in body]
+
+
+def test_mail_over_three_packets():
+    data = SMTP_MAIL + b"\r\n.\r\n"
+    record, _ = run_flow(data_session(data[:20], data[20:50], data[50:]))
+    assert len(record["mails"]) == 1
+    mail = record["mails"][0]
+    assert mail["rule"] == "F8" and mail["status"] == "ok"
+    assert mail["value"]["parts"][0]["text"] == "Hello world"
+    assert record["packet_count"] == 5 and record["reasons"] == []
+
+
+def test_two_mails_one_connection():
+    data = SMTP_MAIL + b"\r\n.\r\n"
+    packets = (data_session(data) + [smtp_packet("s", b"250 ok\r\n", reply(250))]
+               + data_session(data))
+    record, _ = run_flow(packets)
+    assert len(record["mails"]) == 2
+
+
+def test_no_354_means_no_mail():
+    # R14: PCAP thiếu packet chứa 354 → không gom, nhưng flow vẫn chốt thống kê đúng.
+    packets = [smtp_packet("c", b"DATA\r\n", command("DATA")),
+               smtp_packet("c", SMTP_MAIL + b"\r\n.\r\n")]
+    record, _ = run_flow(packets)
+    assert record["mails"] == []
+    assert record["packet_count"] == 2 and record["payload_byte_count"] > 0
+
+
+def test_refused_data_means_no_mail():
+    record, _ = run_flow(data_session(SMTP_MAIL + b"\r\n.\r\n", accepted=False))
+    assert record["mails"] == []
+
+
+def test_354_from_wrong_direction_is_ignored():
+    packets = [smtp_packet("c", b"DATA\r\n", command("DATA")),
+               smtp_packet("c", b"354 x\r\n", reply(354)),          # cùng chiều với DATA
+               smtp_packet("c", SMTP_MAIL + b"\r\n.\r\n")]
+    record, _ = run_flow(packets)
+    assert record["mails"] == []
+
+
+def test_flow_closed_with_data_in_buffer():
+    record, _ = run_flow(data_session(SMTP_MAIL))               # không có dấu kết thúc
+    assert len(record["mails"]) == 1
+    mail = record["mails"][0]
+    assert mail["status"] == "partial" and "no_end_of_data_marker" in mail["reasons"]
+    assert mail["value"]["parts"][0]["text"] == "Hello world"
+
+
+def test_non_smtp_flow_has_no_mails():
+    packets = [tcp_event(A, 5000, B, 80, ["SYN"]), tcp_event(B, 80, A, 5000, ["SYN", "ACK"])]
+    record, _ = run_flow(packets)
+    assert record["mails"] == []
+
+
+def test_reassembly_limit_keeps_partial_and_stats():
+    cfg = Config.load(None, [("max_reassembly_bytes", "40")])
+    record, _ = run_flow(data_session(SMTP_MAIL + b"\r\n.\r\n"), cfg)
+    assert "reassembly_limit=40" in record["reasons"]
+    # Chỗ cắt rơi vào header nên mime_decode có thể báo nặng hơn `partial`; điều cần
+    # giữ là phần đã gom VẪN được giải mã, không báo `ok`, và nêu giới hạn.
+    assert len(record["mails"]) == 1
+    assert record["mails"][0]["status"] != "ok"
+    assert "reassembly_limit=40" in record["mails"][0]["reasons"]
+    assert record["packet_count"] == 3
+
+
+def test_payload_gap_marks_mail_partial():
+    session = data_session(SMTP_MAIL[:30], SMTP_MAIL[30:] + b"\r\n.\r\n")
+    session[-1]["errors"].append({"layer": "capture", "reason": "truncated record"})
+    record, _ = run_flow(session)
+    assert "payload_gap" in record["reasons"]
+    assert record["mails"][0]["status"] == "partial"
+    assert "payload_gap" in record["mails"][0]["reasons"]
+
+
+def test_record_with_mails_is_json_safe():
+    record, _ = run_flow(data_session(SMTP_MAIL + b"\r\n.\r\n"))
+    assert json.loads(json.dumps(record)) == record
