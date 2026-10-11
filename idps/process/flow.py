@@ -62,9 +62,14 @@ class Flow:
         self.fin_directions = set()    # chiều đã gửi FIN; chỉ đo kích thước, không in
         self.start_usec = None
         self.last_seen_usec = None
+        self.packet_count = 0
+        self.byte_count = 0
+        self.direction_packets = {"forward": 0, "backward": 0}
+        self.direction_bytes = {"forward": 0, "backward": 0}
+        self.malformed_packets = 0
 
     def update(self, event, direction):
-        """Tính packet này vào flow: trạng thái rồi mốc thời gian (design §6, bước 6).
+        """Tính packet này vào flow: trạng thái, counter rồi mốc thời gian (§6, bước 6).
 
         `last_seen` cập nhật cả với packet không có payload (ACK/SYN/FIN trơn —
         REQ-31.7): nếu bỏ qua, flow chỉ có handshake trông như im lặng.
@@ -75,6 +80,31 @@ class Flow:
         self.last_seen_usec = ts
         if self.protocol == "TCP":
             self._step_tcp(event, direction)
+        else:
+            # UDP không có kết nối: MỘT trạng thái, không suy ra gì thêm (32.2, 32.4).
+            self.state = "ACTIVE"
+        self._account(event, direction)
+
+    def _account(self, event, direction):
+        """Cộng packet vào counter toàn flow và theo chiều (REQ-34.3, 34.4, 34.7).
+
+        `byte_count` là độ dài GỐC trên dây (`wire_len`), không phải số byte bắt
+        được: capture cắt theo snaplen vẫn phải cho đúng khối lượng traffic.
+        Thiếu `wire_len` thì dùng `cap_len` + ghi lý do, và packet VẪN được đếm
+        (34.8). Packet bài 1 đánh dấu malformed vẫn đếm — nó là bằng chứng có
+        traffic giữa hai endpoint (32.5).
+        """
+        size = event.get("wire_len")
+        if size is None:
+            size = event["cap_len"]
+            event["flow"]["reasons"].append("wire_len_missing")
+        self.packet_count += 1
+        self.byte_count += size
+        self.direction_packets[direction] += 1
+        self.direction_bytes[direction] += size
+        if event.get("status") == "malformed":
+            self.malformed_packets += 1
+            event["flow"]["reasons"].append("malformed_packet")
 
     def _step_tcp(self, event, direction):
         flags = (event.get("tcp") or {}).get("flags") or []

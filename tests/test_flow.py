@@ -227,3 +227,61 @@ def test_closed_absorbs_retransmitted_fin_and_ack():
                   ("c", ["ACK"]), ("s", ["FIN", "ACK"]), ("c", ["ACK"]))
     assert states(events)[3:] == ["CLOSED", "CLOSED", "CLOSED"]
     assert len({e["flow"]["flow_id"] for e in events}) == 1   # không đẻ flow mới
+
+
+# --- T3.3 flow UDP (Phụ lục I.2) ---------------------------------------------
+
+def udp_event(src, sport, dst, dport, wire_len=70, status="ok", ts=1_000_000):
+    event = make_event(src, sport, dst, dport, proto="UDP", ts=ts)
+    event["wire_len"], event["cap_len"], event["status"] = wire_len, wire_len, status
+    return event
+
+
+def test_udp_query_response_is_one_active_flow():
+    tracker = FlowTracker(CFG)
+    query = udp_event(A, 40000, B, 53, wire_len=74)
+    response = udp_event(B, 53, A, 40000, wire_len=90)
+    tracker.process(query)
+    tracker.process(response)
+    flow = tracker.table.flows()[0]
+    assert len(tracker.table) == 1
+    assert query["flow"]["flow_id"] == response["flow"]["flow_id"]
+    assert query["flow"]["state"] == response["flow"]["state"] == "ACTIVE"
+    assert flow.packet_count == 2
+    assert flow.direction_packets == {"forward": 1, "backward": 1}
+    assert flow.direction_bytes == {"forward": 74, "backward": 90}
+    assert flow.byte_count == 164
+
+
+def test_udp_has_no_connection_state():
+    tracker = FlowTracker(CFG)
+    for _ in range(3):
+        tracker.process(udp_event(A, 40000, B, 53))
+    flow = tracker.table.flows()[0]
+    assert flow.state == "ACTIVE"
+    assert flow.midstream is None                  # UDP không có "giữa phiên"
+    assert flow.fin_directions == set() and flow.seen_synack is False
+
+
+def test_udp_malformed_still_counted_with_reason():
+    tracker = FlowTracker(CFG)
+    good = udp_event(A, 40000, B, 53, wire_len=70)
+    bad = udp_event(A, 40000, B, 53, wire_len=60, status="malformed")
+    tracker.process(good)
+    tracker.process(bad)
+    flow = tracker.table.flows()[0]
+    assert bad["flow"]["flow_id"] == good["flow"]["flow_id"]
+    assert (flow.packet_count, flow.byte_count) == (2, 130)
+    assert flow.malformed_packets == 1
+    assert "malformed_packet" in bad["flow"]["reasons"]
+    assert good["flow"]["reasons"] == []
+
+
+def test_wire_len_missing_falls_back_to_cap_len():
+    tracker = FlowTracker(CFG)
+    event = udp_event(A, 40000, B, 53, wire_len=None)
+    event["cap_len"] = 55
+    tracker.process(event)
+    flow = tracker.table.flows()[0]
+    assert (flow.packet_count, flow.byte_count) == (1, 55)    # vẫn đếm packet
+    assert "wire_len_missing" in event["flow"]["reasons"]
