@@ -7,11 +7,22 @@ Một *flow* là mọi packet của cùng một phiên, cả hai chiều. Detect
 File này đọc event từ khoá đã chuẩn hoá của Preprocessor và KHÔNG import gì ngoài
 `.chain` — đối tượng thư viện không lọt sang tầng phát hiện (đề bài §6, I-20).
 """
+from ..core.event import format_timestamp
 from .chain import Stage
 
 _PROTOCOLS = ("TCP", "UDP")
 
 _ANY = None   # "bất kỳ trạng thái" trong bảng chuyển trạng thái
+
+# Phiên bản schema của flow record — bộ đếm RIÊNG, không dùng chung với event (35.3).
+FLOW_SCHEMA_VERSION = 1
+_FLAG_COUNTERS = (("SYN", "syn_count"), ("ACK", "ack_count"),
+                  ("FIN", "fin_count"), ("RST", "rst_count"))
+
+
+def _iso(usec):
+    """Số nguyên micro giây từ epoch → chuỗi ISO 8601 của bài 1 (ADR-7, không float)."""
+    return format_timestamp(*divmod(usec, 1_000_000))
 
 
 # --- máy trạng thái TCP (Phụ lục I.1) ---------------------------------------
@@ -67,6 +78,10 @@ class Flow:
         self.direction_packets = {"forward": 0, "backward": 0}
         self.direction_bytes = {"forward": 0, "backward": 0}
         self.malformed_packets = 0
+        self.payload_byte_count = 0
+        self.flag_counts = {name: 0 for _, name in _FLAG_COUNTERS}
+        self.application_protocol = None
+        self.notes = []                # ghi chú mức flow, vào `reasons` của record
 
     def update(self, event, direction):
         """Tính packet này vào flow: trạng thái, counter rồi mốc thời gian (§6, bước 6).
@@ -84,6 +99,18 @@ class Flow:
             # UDP không có kết nối: MỘT trạng thái, không suy ra gì thêm (32.2, 32.4).
             self.state = "ACTIVE"
         self._account(event, direction)
+        self._note_application_protocol(event)
+
+    def _note_application_protocol(self, event):
+        """Lấy từ packet ĐẦU TIÊN có app_proto thật, rồi giữ nguyên (34.6, A10).
+
+        Không đổi về sau: nếu một packet giữa chừng bị nhận nhầm giao thức thì tên
+        của cả phiên không được nhảy theo.
+        """
+        if self.application_protocol is None:
+            proto = event["preprocess"].get("app_proto")
+            if proto not in (None, "UNKNOWN"):
+                self.application_protocol = proto
 
     def _account(self, event, direction):
         """Cộng packet vào counter toàn flow và theo chiều (REQ-34.3, 34.4, 34.7).
@@ -98,8 +125,19 @@ class Flow:
         if size is None:
             size = event["cap_len"]
             event["flow"]["reasons"].append("wire_len_missing")
+            if "wire_len_missing" not in self.notes:
+                self.notes.append("wire_len_missing")
         self.packet_count += 1
         self.byte_count += size
+        # Thống kê THÊM: byte tải của TCP/UDP, không thay byte_count (A13).
+        payload = ((event.get("tcp") or event.get("udp") or {}).get("payload_len")) or 0
+        self.payload_byte_count += payload
+        if self.protocol == "TCP":
+            # Đếm CỜ, không đếm vai trò: SYN+ACK cộng cả syn_count và ack_count (34.5).
+            flags = (event.get("tcp") or {}).get("flags") or []
+            for flag, name in _FLAG_COUNTERS:
+                if flag in flags:
+                    self.flag_counts[name] += 1
         self.direction_packets[direction] += 1
         self.direction_bytes[direction] += size
         if event.get("status") == "malformed":
@@ -123,6 +161,48 @@ class Flow:
             self.fin_directions.add(direction)
         if "SYN" in flags and "ACK" in flags and direction == "backward":
             self.seen_synack = True
+
+    def to_record(self, close_usec, close_reason):
+        """Dựng flow record: ĐÚNG tập khoá design §5.3, chỉ chứa kiểu JSON (I-13).
+
+        Dựng từ giá trị đã chốt, không tham chiếu ngược event — record là bản chốt
+        sổ của flow chứ không phải một event (C-18). Khoá `mails` rỗng tới Phase 4.
+        """
+        reasons = list(self.notes)
+        if self.malformed_packets:
+            reasons.append(f"malformed_packets={self.malformed_packets}")
+        is_tcp = self.protocol == "TCP"
+        return {
+            "schema_version": FLOW_SCHEMA_VERSION,
+            "flow_id": self.flow_id,
+            "protocol": self.protocol,
+            "application_protocol": self.application_protocol,
+            "endpoint_a": {"ip": self.endpoint_a[0], "port": self.endpoint_a[1]},
+            "endpoint_b": {"ip": self.endpoint_b[0], "port": self.endpoint_b[1]},
+            "start_time": _iso(self.start_usec),
+            "last_seen": _iso(self.last_seen_usec),
+            "close_time": _iso(close_usec),
+            "start_time_usec": self.start_usec,
+            "last_seen_usec": self.last_seen_usec,
+            "duration_usec": self.last_seen_usec - self.start_usec,
+            "packet_count": self.packet_count,
+            "byte_count": self.byte_count,
+            "forward_packet_count": self.direction_packets["forward"],
+            "forward_byte_count": self.direction_bytes["forward"],
+            "backward_packet_count": self.direction_packets["backward"],
+            "backward_byte_count": self.direction_bytes["backward"],
+            "payload_byte_count": self.payload_byte_count,
+            # Flow UDP: bốn counter cờ giữ 0 (không bao giờ được cộng — REQ-32.4).
+            "syn_count": self.flag_counts["syn_count"],
+            "ack_count": self.flag_counts["ack_count"],
+            "fin_count": self.flag_counts["fin_count"],
+            "rst_count": self.flag_counts["rst_count"],
+            "state": self.state,
+            "midstream": self.midstream if is_tcp else None,
+            "close_reason": close_reason,
+            "mails": [],
+            "reasons": reasons,
+        }
 
 
 def _endpoints(event):

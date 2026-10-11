@@ -2,6 +2,8 @@
 
 T3.1: khoá hai chiều + flow_id. Các task sau thêm test vào cuối file này.
 """
+import json
+
 from idps.core.event import new_event
 from idps.core.frame import RawFrame
 from idps.process.config import Config
@@ -285,3 +287,120 @@ def test_wire_len_missing_falls_back_to_cap_len():
     flow = tracker.table.flows()[0]
     assert (flow.packet_count, flow.byte_count) == (1, 55)    # vẫn đếm packet
     assert "wire_len_missing" in event["flow"]["reasons"]
+
+
+# --- T3.4 thống kê per-flow và hình dạng flow record --------------------------
+
+RECORD_KEYS = [
+    "schema_version", "flow_id", "protocol", "application_protocol", "endpoint_a",
+    "endpoint_b", "start_time", "last_seen", "close_time", "start_time_usec",
+    "last_seen_usec", "duration_usec", "packet_count", "byte_count",
+    "forward_packet_count", "forward_byte_count", "backward_packet_count",
+    "backward_byte_count", "payload_byte_count", "syn_count", "ack_count",
+    "fin_count", "rst_count", "state", "midstream", "close_reason", "mails", "reasons",
+]
+
+
+def close_all(tracker, usec=9_000_000):
+    return [f.to_record(usec, "end_of_run") for f in tracker.table.flows()]
+
+
+def sized(event, wire_len, payload_len=0):
+    event["wire_len"] = event["cap_len"] = wire_len
+    event["tcp"]["payload_len"] = payload_len
+    return event
+
+
+def test_counts_add_up():
+    tracker = FlowTracker(CFG)
+    packets = [("c", ["SYN"], 74, 0), ("s", ["SYN", "ACK"], 74, 0), ("c", ["ACK"], 66, 0),
+               ("c", ["PSH", "ACK"], 300, 234), ("s", ["ACK"], 66, 0),
+               ("s", ["PSH", "ACK"], 500, 434)]
+    for n, (side, flags, size, payload) in enumerate(packets):
+        src = (A, 5000, B, 80) if side == "c" else (B, 80, A, 5000)
+        tracker.process(sized(tcp_event(*src, flags, ts=1_000_000 + n), size, payload))
+    [record] = close_all(tracker)
+    assert record["packet_count"] == record["forward_packet_count"] + record["backward_packet_count"] == 6
+    assert record["byte_count"] == record["forward_byte_count"] + record["backward_byte_count"] == 1080
+    assert (record["forward_byte_count"], record["backward_byte_count"]) == (440, 640)
+    assert record["payload_byte_count"] == 668                   # thống kê thêm
+
+
+def test_zero_payload_packets_are_counted():
+    tracker = FlowTracker(CFG)
+    tracker.process(sized(tcp_event(A, 5000, B, 80, ["SYN"]), 74, 0))
+    [record] = close_all(tracker)
+    assert record["packet_count"] == 1 and record["payload_byte_count"] == 0
+
+
+def test_flag_counts_count_flags_not_roles():
+    tracker = FlowTracker(CFG)
+    feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]),
+         ("c", ["FIN", "ACK"]), ("s", ["RST"]))
+    [record] = close_all(tracker)
+    assert (record["syn_count"], record["ack_count"],
+            record["fin_count"], record["rst_count"]) == (2, 3, 1, 1)   # SYN+ACK cộng cả hai
+
+
+def test_udp_flag_counters_stay_zero():
+    tracker = FlowTracker(CFG)
+    tracker.process(udp_event(A, 40000, B, 53))
+    [record] = close_all(tracker)
+    assert (record["syn_count"], record["ack_count"],
+            record["fin_count"], record["rst_count"]) == (0, 0, 0, 0)
+    assert record["state"] == "ACTIVE" and record["midstream"] is None
+
+
+def test_record_keys():
+    tracker = FlowTracker(CFG)
+    feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]))
+    tracker.process(udp_event(A, 40000, B, 53))
+    for record in close_all(tracker):
+        assert list(record) == RECORD_KEYS                       # đúng tập, đúng thứ tự
+        json.loads(json.dumps(record))                           # chỉ kiểu JSON
+        assert "preprocess" not in record and "packet_id" not in record   # không phải event
+        assert record["schema_version"] == 1
+
+
+def test_record_time_fields_are_integers_and_consistent():
+    tracker = FlowTracker(CFG)
+    feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]))
+    [record] = close_all(tracker, usec=1_790_486_523_123_456)
+    assert record["duration_usec"] == 2
+    assert type(record["duration_usec"]) is int
+    assert record["start_time_usec"] == 1_000_000
+    assert record["close_time"] == "2026-09-27T05:22:03.123456Z"
+    assert record["start_time"] == "1970-01-01T00:00:01.000000Z"
+
+
+def test_wire_len_missing_noted_on_flow_record():
+    tracker = FlowTracker(CFG)
+    event = udp_event(A, 40000, B, 53, wire_len=None)
+    event["cap_len"] = 55
+    tracker.process(event)
+    [record] = close_all(tracker)
+    assert record["byte_count"] == 55 and "wire_len_missing" in record["reasons"]
+
+
+def test_malformed_noted_on_flow_record():
+    tracker = FlowTracker(CFG)
+    tracker.process(udp_event(A, 40000, B, 53, status="malformed"))
+    tracker.process(udp_event(A, 40000, B, 53, status="malformed"))
+    [record] = close_all(tracker)
+    assert "malformed_packets=2" in record["reasons"]
+
+
+def test_application_protocol_set_once_and_kept():
+    tracker = FlowTracker(CFG)
+    first = tcp_event(A, 5000, B, 80, ["SYN"])                   # chưa có app_proto
+    second = tcp_event(A, 5000, B, 80, ["ACK"])
+    second["preprocess"]["app_proto"] = "HTTP"
+    third = tcp_event(A, 5000, B, 80, ["ACK"])
+    third["preprocess"]["app_proto"] = "SMTP"                    # không được đè
+    unknown = tcp_event(A, 6000, B, 80, ["ACK"])
+    unknown["preprocess"]["app_proto"] = "UNKNOWN"
+    for event in (first, second, third, unknown):
+        tracker.process(event)
+    first_flow, other_flow = close_all(tracker)
+    assert first_flow["application_protocol"] == "HTTP"
+    assert other_flow["application_protocol"] is None            # UNKNOWN không tính
