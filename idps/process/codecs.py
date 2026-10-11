@@ -130,7 +130,13 @@ def form_decode(value, limit):
     if bad is not None:
         reasons.append(f"invalid_percent_escape_at={bad}")
     pairs = urllib.parse.parse_qsl(value, keep_blank_values=True)
-    status = "partial" if bad is not None else "ok"
+    # parse_qsl decode UTF-8 với errors="replace" một cách IM LẶNG: giá trị trả về
+    # có U+FFFD mà không có lý do nào. Dò lại trên BYTES nguồn để luật ADR-21 (vị
+    # trí + giá trị byte lỗi đầu tiên) áp cho F2/F3 y như F1 — nếu không, cùng một
+    # query `?q=%FF` sẽ ra `partial` ở `decode.uri` nhưng `ok` ở `decode.query`.
+    text = to_text(urllib.parse.unquote_to_bytes(value.replace("+", " ")))
+    reasons += text["reasons"]
+    status = "partial" if (bad is not None or text["status"] == "partial") else "ok"
     return decoded([[name, val] for name, val in pairs], None, status, reasons)
 
 

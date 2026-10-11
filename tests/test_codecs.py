@@ -108,6 +108,14 @@ def test_to_text_valid_ascii():
     assert dv["reasons"] == []
 
 
+def test_form_decode_invalid_utf8_is_partial():
+    """F2/F3 phải báo byte lỗi như F1, không im lặng thay bằng U+FFFD."""
+    dv = form_decode("q=%FF%27", 65536)
+    assert dv["status"] == "partial"
+    assert any("value=0xFF" in r for r in dv["reasons"])
+    assert dv["value"] == [["q", "\ufffd'"]]
+
+
 def test_to_text_invalid_byte_is_partial():
     dv = to_text(b"ok\xffbad")
     assert dv["status"] == "partial"
