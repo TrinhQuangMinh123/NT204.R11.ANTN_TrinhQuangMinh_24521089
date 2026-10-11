@@ -647,16 +647,16 @@ SMTP_MAIL = (b"Subject: hi\r\nContent-Transfer-Encoding: base64\r\n\r\n"
              b"SGVsbG8gd29ybGQ=\r\n")
 
 
-def smtp_packet(side, payload=b"", app=None, ts=1_000_000):
+def smtp_packet(side, payload=b"", app=None, ts=1_000_000, port=5000):
     """Packet SMTP dựng tay: c = client A:5000 → server B:25, s = chiều ngược lại.
 
     `app` là khoá `app` mà parser bài 1 sẽ điền (lệnh/reply); packet nội dung thư
     không có `app` — parser không parse nội dung thư.
     """
     if side == "c":
-        event = tcp_event(A, 5000, B, 25, ["ACK", "PSH"], payload_len=len(payload), ts=ts)
+        event = tcp_event(A, port, B, 25, ["ACK", "PSH"], payload_len=len(payload), ts=ts)
     else:
-        event = tcp_event(B, 25, A, 5000, ["ACK", "PSH"], payload_len=len(payload), ts=ts)
+        event = tcp_event(B, 25, A, port, ["ACK", "PSH"], payload_len=len(payload), ts=ts)
     event["tcp"]["payload_b64"] = base64.b64encode(payload).decode("ascii")
     event["preprocess"]["app_proto"] = "SMTP" if app else None
     event["app"] = app
@@ -768,3 +768,33 @@ def test_payload_gap_marks_mail_partial():
 def test_record_with_mails_is_json_safe():
     record, _ = run_flow(data_session(SMTP_MAIL + b"\r\n.\r\n"))
     assert json.loads(json.dumps(record)) == record
+
+
+def test_total_budget_stops_largest_buffer_first():
+    # I-19, REQ-40.5: tổng mọi bộ đệm ≤ ngưỡng sau MỖI packet; flow lớn nhất bị dừng trước.
+    cfg = Config.load(None, [("max_reassembly_total_bytes", "100")])
+    sink = RecordingSink()
+    tracker = FlowTracker(cfg, [sink])
+    ports = (5001, 5002, 5003)
+    for port in ports:                                   # cả ba vào pha DATA, bộ đệm rỗng
+        tracker.process(smtp_packet("c", b"DATA\r\n", command("DATA"), port=port))
+        tracker.process(smtp_packet("s", b"354 go\r\n", reply(354), port=port))
+
+    def held():
+        return sum(f.mail_buffer.buffered for f in tracker.table.flows() if f.mail_buffer)
+
+    for port, size in ((5001, 50), (5002, 30), (5003, 15), (5002, 10), (5003, 30)):
+        tracker.process(smtp_packet("c", b"x" * size, port=port))
+        assert held() <= 100
+    flows = {f.endpoint_a[1]: f for f in tracker.table.flows()}
+    assert flows[5001].mail_stopped                      # 50 byte: lớn nhất khi tổng chạm 105
+    assert not flows[5002].mail_stopped and not flows[5003].mail_stopped
+    tracker.close()
+    records = {r["endpoint_a"]["port"]: r for r in sink.records}
+    assert len(records) == 3                             # mọi flow vẫn được chốt
+    assert "reassembly_total_limit=100" in records[5001]["reasons"]
+    assert records[5001]["mails"][0]["status"] != "ok"   # phần đã gom vẫn được giải mã
+    assert "reassembly_total_limit=100" in records[5001]["mails"][0]["reasons"]
+    assert records[5001]["packet_count"] == 3            # DATA + 354 + 1 packet nội dung
+    assert records[5002]["packet_count"] == records[5003]["packet_count"] == 4
+    assert "reassembly_total_limit=100" not in records[5002]["reasons"]

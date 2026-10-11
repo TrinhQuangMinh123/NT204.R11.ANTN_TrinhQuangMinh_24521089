@@ -435,6 +435,7 @@ class FlowTracker(Stage):
             self._look_for_data_phase(flow, event, direction)
         elif direction == flow.mail_direction:
             self._collect_mail(flow, event)
+            self._enforce_total_budget()
 
     def _look_for_data_phase(self, flow, event, direction):
         """Vào pha DATA khi thấy lệnh `DATA` rồi reply `354` từ chiều NGƯỢC (ADR-26).
@@ -481,15 +482,38 @@ class FlowTracker(Stage):
         for raw in complete:
             self._add_mail(flow, raw, partial=False, reasons=())
         if buffer.stopped:
-            # Dừng gom nhưng KHÔNG bỏ phần đã có: giải mã nó, đánh dấu dở dang (REQ-40.4).
-            for raw in buffer.flush():
-                self._add_mail(flow, raw, partial=True, reasons=buffer.reasons)
-            flow.mail_stopped = True
-            for reason in buffer.reasons:
-                self._note(flow, reason)
-            self._leave_data_phase(flow)
+            self._stop_mail(flow, buffer.reasons)
         elif complete:
             self._leave_data_phase(flow)     # dấu kết thúc đóng pha; thư sau mở bộ đệm mới
+
+    def _stop_mail(self, flow, reasons):
+        """Dừng gom cho flow này nhưng KHÔNG bỏ phần đã có: giải mã nó, đánh dấu dở dang.
+
+        Dùng chung cho hai giới hạn (REQ-40.4 của flow, REQ-40.5 của toàn bộ). Flow
+        vẫn được theo dõi thống kê bình thường — chỉ thôi gom thư.
+        """
+        for raw in flow.mail_buffer.flush():
+            self._add_mail(flow, raw, partial=True, reasons=reasons)
+        flow.mail_stopped = True
+        for reason in reasons:
+            self._note(flow, reason)
+        self._leave_data_phase(flow)
+
+    def _enforce_total_budget(self):
+        """Tổng mọi bộ đệm ≤ `max_reassembly_total_bytes` sau MỖI packet (I-19, REQ-40.5).
+
+        Vượt thì dừng flow có bộ đệm LỚN NHẤT trước (hoà → flow tạo trước): nó là
+        flow đang ăn nhiều nhất, dừng một flow giải phóng được nhiều chỗ nhất. Mỗi
+        vòng giải phóng ít nhất một bộ đệm nên vòng lặp luôn kết thúc. Quét cả bảng
+        vì lab chỉ có vài chục flow (A11); chỉ gọi sau packet nối thêm vào bộ đệm.
+        """
+        limit = self.config["max_reassembly_total_bytes"]
+        while True:
+            holders = [f for f in self.table.flows() if f.mail_buffer is not None]
+            if sum(f.mail_buffer.buffered for f in holders) <= limit:
+                return
+            biggest = max(holders, key=lambda f: f.mail_buffer.buffered)
+            self._stop_mail(biggest, [f"reassembly_total_limit={limit}"])
 
     def _finish_mail(self, flow):
         """Flow rời bảng khi bộ đệm còn dữ liệu → giải mã phần đã gom (REQ-40.3, 40.6)."""
