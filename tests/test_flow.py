@@ -10,16 +10,41 @@ from idps.process.flow import FlowTracker
 CFG = Config.load()
 
 
-def make_event(src, sport, dst, dport, proto="TCP", packet_id=1):
+def make_event(src, sport, dst, dport, proto="TCP", packet_id=1, ts=1_000_000):
     """Event tối thiểu: đúng những field Flow Tracker đọc (đã qua Preprocessor)."""
     event = new_event(RawFrame(b"\x00" * 14, 1790486523, 0, 60, 1, "pcap"), packet_id)
     event["transport_proto"] = proto
     event["src_ip"], event["dst_ip"] = src, dst
     event["src_port"], event["dst_port"] = sport, dport
     event["preprocess"].update(
-        transport_proto=proto, src_ip=src, dst_ip=dst, status="valid", action="forwarded"
+        transport_proto=proto, src_ip=src, dst_ip=dst, status="valid", action="forwarded",
+        ts_usec=ts,
     )
     return event
+
+
+def tcp_event(src, sport, dst, dport, flags, payload_len=0, ts=1_000_000):
+    event = make_event(src, sport, dst, dport, ts=ts)
+    event["tcp"] = {"src_port": sport, "dst_port": dport, "flags": list(flags),
+                    "payload_len": payload_len}
+    return event
+
+
+def feed(tracker, *packets):
+    """Đưa từng packet (c=client A→B, s=server B→A, cờ) vào tracker; trả các event."""
+    events = []
+    for n, (side, flags) in enumerate(packets):
+        if side == "c":
+            event = tcp_event(A, 5000, B, 80, flags, ts=1_000_000 + n)
+        else:
+            event = tcp_event(B, 80, A, 5000, flags, ts=1_000_000 + n)
+        tracker.process(event)
+        events.append(event)
+    return events
+
+
+def states(events):
+    return [e["flow"]["state"] for e in events]
 
 
 A, B = "10.10.0.10", "10.20.0.10"
@@ -105,3 +130,100 @@ def test_no_five_tuple():
     ok = make_event(A, 5000, B, 80)
     tracker.process(ok)
     assert ok["flow"]["flow_id"] == 1                         # bộ đếm không bị tiêu
+
+
+# --- T3.2 máy trạng thái TCP (Phụ lục I.1) — một test mỗi dòng ---------------
+
+def test_syn_starts_handshake():
+    tracker = FlowTracker(CFG)
+    [syn] = feed(tracker, ("c", ["SYN"]))
+    assert syn["flow"]["state"] == "HANDSHAKE"
+    assert tracker.table.flows()[0].midstream is False
+
+
+def test_synack_stays_handshake():
+    tracker = FlowTracker(CFG)
+    assert states(feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]))) == \
+        ["HANDSHAKE", "HANDSHAKE"]
+    assert tracker.table.flows()[0].seen_synack is True
+
+
+def test_forward_ack_after_synack_establishes():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]))
+    assert states(events) == ["HANDSHAKE", "HANDSHAKE", "ESTABLISHED"]
+
+
+def test_ack_without_synack_does_not_establish():
+    # SYN rồi ACK suông chiều thuận mà chưa có SYN/ACK trả lời -> chưa là kết nối.
+    tracker = FlowTracker(CFG)
+    assert states(feed(tracker, ("c", ["SYN"]), ("c", ["ACK"]))) == ["HANDSHAKE"] * 2
+
+
+def test_backward_ack_does_not_establish():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("s", ["ACK"]))
+    assert states(events)[-1] == "HANDSHAKE"
+
+
+def test_fin_moves_to_closing():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]),
+                  ("c", ["FIN", "ACK"]))
+    assert states(events)[-1] == "CLOSING"
+
+
+def test_fin_both_ways_then_ack_closes():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["ACK"]), ("c", ["FIN", "ACK"]), ("s", ["ACK"]),
+                  ("s", ["FIN", "ACK"]), ("c", ["ACK"]))
+    # ACK của server sau FIN đầu (mới một chiều FIN) KHÔNG đóng; FIN thứ hai cũng
+    # chưa; chỉ ACK sau FIN cuối mới CLOSED.
+    assert states(events) == ["ESTABLISHED", "CLOSING", "CLOSING", "CLOSING", "CLOSED"]
+
+
+def test_one_sided_fin_never_closes():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["ACK"]), ("c", ["FIN", "ACK"]),
+                  ("c", ["ACK"]), ("s", ["ACK"]))
+    assert states(events)[-1] == "CLOSING"
+
+
+def test_rst_resets_from_any_state():
+    for opening in ([("c", ["SYN"])],                                # HANDSHAKE
+                    [("c", ["ACK"])],                                # ESTABLISHED
+                    [("c", ["ACK"]), ("c", ["FIN", "ACK"])]):        # CLOSING
+        tracker = FlowTracker(CFG)
+        events = feed(tracker, *opening, ("s", ["RST"]))
+        assert states(events)[-1] == "RESET", opening
+
+
+def test_midstream_first_packet_is_established():
+    tracker = FlowTracker(CFG)
+    [first] = feed(tracker, ("c", ["ACK"]))
+    assert first["flow"]["state"] == "ESTABLISHED"
+    assert tracker.table.flows()[0].midstream is True
+
+
+def test_first_synack_is_midstream_not_handshake():
+    tracker = FlowTracker(CFG)
+    [first] = feed(tracker, ("c", ["SYN", "ACK"]))
+    assert first["flow"]["state"] == "ESTABLISHED"
+    assert tracker.table.flows()[0].midstream is True
+
+
+def test_empty_payload_still_updates_last_seen():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]))
+    flow = tracker.table.flows()[0]
+    assert all(e["tcp"]["payload_len"] == 0 for e in events)
+    assert flow.start_usec == 1_000_000
+    assert flow.last_seen_usec == 1_000_002           # đổi theo từng packet rỗng
+
+
+def test_closed_absorbs_retransmitted_fin_and_ack():
+    tracker = FlowTracker(CFG)
+    events = feed(tracker, ("c", ["ACK"]), ("c", ["FIN", "ACK"]), ("s", ["FIN", "ACK"]),
+                  ("c", ["ACK"]), ("s", ["FIN", "ACK"]), ("c", ["ACK"]))
+    assert states(events)[3:] == ["CLOSED", "CLOSED", "CLOSED"]
+    assert len({e["flow"]["flow_id"] for e in events}) == 1   # không đẻ flow mới

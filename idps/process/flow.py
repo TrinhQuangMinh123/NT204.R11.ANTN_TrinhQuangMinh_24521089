@@ -11,6 +11,41 @@ from .chain import Stage
 
 _PROTOCOLS = ("TCP", "UDP")
 
+_ANY = None   # "bất kỳ trạng thái" trong bảng chuyển trạng thái
+
+
+# --- máy trạng thái TCP (Phụ lục I.1) ---------------------------------------
+# Dạng DỮ LIỆU: mỗi dòng (từ trạng thái, tên điều kiện, sang trạng thái); dòng đầu
+# tiên khớp thắng, không khớp dòng nào thì giữ nguyên. Thứ tự dòng LÀ luật ưu tiên:
+#   RST thắng tất cả · RESET/CLOSED "hút" mọi packet còn lại (FIN/ACK truyền lại
+#   vẫn được đếm vào flow cũ, không đẻ flow mới — REQ-31.9) · CLOSING chỉ thành
+#   CLOSED khi đã có FIN hai chiều và gặp ACK · FIN đầu tiên → CLOSING.
+_TCP_TRANSITIONS = (
+    (_ANY,        "rst",                "RESET"),
+    ("RESET",     "always",             "RESET"),
+    ("CLOSED",    "always",             "CLOSED"),
+    ("CLOSING",   "ack_after_both_fin", "CLOSED"),
+    (_ANY,        "fin",                "CLOSING"),
+    ("HANDSHAKE", "final_ack",          "ESTABLISHED"),
+)
+
+# Điều kiện nhận (flow, cờ, chiều) và nhìn flow ở thời điểm TRƯỚC packet này —
+# bookkeeping (chiều đã gửi FIN, đã thấy SYN/ACK) cập nhật SAU khi tra bảng.
+# `ack_after_both_fin`: ACK đầu tiên SAU khi cả hai chiều đã FIN — không cần theo
+# seq/ack vì việc đó chỉ có nghĩa khi ghép luồng TCP, ngoài phạm vi bài.
+_TCP_CONDITIONS = {
+    "always": lambda flow, flags, direction: True,
+    "rst": lambda flow, flags, direction: "RST" in flags,
+    "fin": lambda flow, flags, direction: "FIN" in flags,
+    "ack_after_both_fin": lambda flow, flags, direction: (
+        len(flow.fin_directions) == 2 and "ACK" in flags
+    ),
+    "final_ack": lambda flow, flags, direction: (
+        flow.seen_synack and direction == "forward"
+        and "ACK" in flags and "SYN" not in flags
+    ),
+}
+
 
 class Flow:
     """Một phiên đang theo dõi. Mỗi task sau thêm field vào đây (state, counter…)."""
@@ -21,6 +56,43 @@ class Flow:
         self.protocol = key[0]
         self.endpoint_a = endpoint_a   # (ip, port) nguồn của packet ĐẦU TIÊN
         self.endpoint_b = endpoint_b
+        self.state = None
+        self.midstream = None          # TCP: True nếu packet đầu không phải SYN
+        self.seen_synack = False       # đã thấy SYN+ACK chiều ngược trong HANDSHAKE
+        self.fin_directions = set()    # chiều đã gửi FIN; chỉ đo kích thước, không in
+        self.start_usec = None
+        self.last_seen_usec = None
+
+    def update(self, event, direction):
+        """Tính packet này vào flow: trạng thái rồi mốc thời gian (design §6, bước 6).
+
+        `last_seen` cập nhật cả với packet không có payload (ACK/SYN/FIN trơn —
+        REQ-31.7): nếu bỏ qua, flow chỉ có handshake trông như im lặng.
+        """
+        ts = event["preprocess"].get("ts_usec")
+        if self.start_usec is None:
+            self.start_usec = ts
+        self.last_seen_usec = ts
+        if self.protocol == "TCP":
+            self._step_tcp(event, direction)
+
+    def _step_tcp(self, event, direction):
+        flags = (event.get("tcp") or {}).get("flags") or []
+        if self.state is None:
+            # Packet đầu: chỉ SYN thuần mới là mở đầu bắt tay (31.1). Mọi packet
+            # khác — kể cả SYN+ACK — là bắt giữa phiên, không phải lỗi (31.8).
+            if "SYN" in flags and "ACK" not in flags:
+                self.state, self.midstream = "HANDSHAKE", False
+            else:
+                self.state, self.midstream = "ESTABLISHED", True
+        for source, condition, target in _TCP_TRANSITIONS:
+            if source in (_ANY, self.state) and _TCP_CONDITIONS[condition](self, flags, direction):
+                self.state = target
+                break
+        if "FIN" in flags:
+            self.fin_directions.add(direction)
+        if "SYN" in flags and "ACK" in flags and direction == "backward":
+            self.seen_synack = True
 
 
 def _endpoints(event):
@@ -68,6 +140,10 @@ class FlowTable:
     def __len__(self):
         return len(self._flows)
 
+    def flows(self):
+        """Các flow đang active, theo thứ tự được tạo (thứ tự chèn của dict)."""
+        return list(self._flows.values())
+
     def get_or_create(self, key, event):
         """Trả `(flow, vừa_tạo)`. Flow mới lấy NGUỒN của event làm endpoint A."""
         flow = self._flows.get(key)
@@ -109,5 +185,8 @@ class FlowTracker(Stage):
             self._next_flow_id += 1
 
         event["flow"]["flow_id"] = flow.flow_id
-        event["flow"]["direction"] = "forward" if src == flow.endpoint_a else "backward"
+        direction = "forward" if src == flow.endpoint_a else "backward"
+        flow.update(event, direction)
+        event["flow"]["direction"] = direction
+        event["flow"]["state"] = flow.state     # trạng thái SAU khi tính packet này
         return True
