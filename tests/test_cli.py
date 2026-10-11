@@ -9,6 +9,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -52,13 +53,25 @@ def run_cli(*args, cwd=None):
     # PYTHONPATH: test chạy với cwd là thư mục tạm nên package idps không nằm
     # trên đường import mặc định của tiến trình con.
     env = dict(os.environ, PYTHONPATH=str(ROOT))
-    return subprocess.run(
-        [sys.executable, str(MAIN), *[str(a) for a in args]],
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+
+    def _run(work_dir):
+        return subprocess.run(
+            [sys.executable, str(MAIN), *[str(a) for a in args]],
+            cwd=str(work_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    if cwd is not None:
+        return _run(cwd)
+    # cwd mặc định là một thư mục tạm dùng một lần, KHÔNG phải gốc repo: lệnh
+    # không truyền --flow-output/-o sẽ ghi flows.jsonl/events.jsonl mặc định vào
+    # cwd; nếu cwd là gốc repo thì mỗi lần chạy test để lại rác trong repo. Chạy
+    # ở thư mục tạm cũng khiến `idps-config.json` không tồn tại ở đó -> Config
+    # dùng mặc định Phụ lục J, trùng từng giá trị với tệp mặc định của repo.
+    with tempfile.TemporaryDirectory() as scratch:
+        return _run(scratch)
 
 
 def lines_of(path):
