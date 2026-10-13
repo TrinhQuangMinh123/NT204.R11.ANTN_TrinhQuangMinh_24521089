@@ -1,10 +1,16 @@
 """T2.1 — Preprocessor validation: valid/partial/invalid (REQ-26, Phụ lục G).
 
 Normalization (T2.2) và policy/gate (T2.3) thêm test ở commit sau.
+T7.4 thêm ca bản ghi SAI KIỂU DỮ LIỆU chạy qua cả ba module (REQ-38.7).
 """
+import json
+
 from idps.core.event import format_timestamp, new_event
 from idps.core.frame import RawFrame
+from idps.process.chain import ProcessingChain
 from idps.process.config import Config
+from idps.process.decoder import Decoder
+from idps.process.flow import FlowTracker
 from idps.process.preprocessor import Preprocessor
 
 CFG = Config.load()
@@ -256,3 +262,73 @@ def test_path_traversal_continues_even_under_skip():
     assert ev["preprocess"]["status"] == "partial"
     assert ev["preprocess"]["action"] == "marked"
     assert keep is True
+
+
+# --- T7.4: bản ghi SAI KIỂU DỮ LIỆU đi qua cả ba module (REQ-38.7) ---------
+#
+# Vì sao ca này KHÔNG kiểm bằng PCAP: bài 1 đọc port bằng `struct.unpack` và
+# sinh timestamp bằng `format_timestamp`, nên port luôn là `int` và timestamp
+# luôn là `str` — không có PCAP nào cho ra `src_port` = `"80"`. Hình dạng đó chỉ
+# xuất hiện khi một module phía trước bị sửa sai hoặc khi event tới từ nguồn
+# khác, và nó phải bị chặn chứ không được làm sập lần chạy (REQ-26.5).
+#
+# Chạy cả ba module (`Decoder` → `Preprocessor` → `FlowTracker`) qua
+# `ProcessingChain` chứ không gọi riêng Preprocessor: điều cần kiểm là bản ghi
+# sai kiểu **không đi tới** tracker và **không** sinh lỗi `internal` ở bất kỳ
+# tầng nào. Gọi riêng Preprocessor chỉ chứng minh được nửa đầu.
+
+WRONG_TYPE_CASES = {
+    "src_port_str": ({"src_port": "80"}, "src_port", "type str"),
+    "dst_port_str": ({"dst_port": "443"}, "dst_port", "type str"),
+    "timestamp_int": ({"timestamp": 1790486523}, "timestamp", "type int"),
+    "timestamp_float": ({"timestamp": 1790486523.5}, "timestamp", "type float"),
+    "packet_id_str": ({"packet_id": "7"}, "packet_id", "type str"),
+    "schema_version_str": ({"schema_version": "2"}, "schema_version", "type str"),
+    "status_int": ({"status": 0}, "status", "type int"),
+}
+
+
+def wrong_type_chain(overrides):
+    """Cho một event sai kiểu chạy hết ba module; trả (event, chain, tracker)."""
+    chain = ProcessingChain([Decoder(CFG), Preprocessor(CFG), FlowTracker(CFG)])
+    chain.handle(event := base_event(**overrides))
+    return event, chain
+
+
+def test_wrong_type_is_invalid_and_names_field_and_type():
+    for case, (overrides, field, actual) in WRONG_TYPE_CASES.items():
+        event, _ = wrong_type_chain(overrides)
+        pp = event["preprocess"]
+        assert pp["status"] == "invalid", case
+        assert any(field in r and actual in r for r in pp["reasons"]), \
+            f"{case}: {pp['reasons']}"
+
+
+def test_wrong_type_never_reaches_flow_tracker():
+    # `flow_id` phải còn `None` — giá trị khởi tạo của khoá `flow`. Nếu tracker
+    # chạy thì nó cấp số 1, và đó là bằng chứng cổng chặn đã hở.
+    for case, (overrides, _, _) in WRONG_TYPE_CASES.items():
+        event, _ = wrong_type_chain(overrides)
+        assert event["flow"]["flow_id"] is None, case
+        assert event["flow"]["direction"] is None, case
+        assert event["flow"]["state"] is None, case
+
+
+def test_wrong_type_raises_no_internal_error():
+    # NFR-10: lỗi dự kiến là DỮ LIỆU, không phải ngoại lệ. `error_counts` rỗng
+    # nghĩa là không stage nào ném, và `errors` của event không có lỗi tầng
+    # `internal` (tên tầng mà `_record_error` dùng cho bug của chính mình).
+    for case, (overrides, _, _) in WRONG_TYPE_CASES.items():
+        event, chain = wrong_type_chain(overrides)
+        assert chain.error_counts == {}, case
+        assert [e for e in event["errors"] if e["layer"] == "internal"] == [], case
+
+
+def test_wrong_type_event_still_json_safe():
+    # REQ-28.3: bản ghi bị chặn vẫn phải ghi ra được output (để lại dấu vết).
+    # Giá trị sai kiểu nằm nguyên trong event, nên dòng JSON vẫn phải dump được.
+    for case, (overrides, _, _) in WRONG_TYPE_CASES.items():
+        event, _ = wrong_type_chain(overrides)
+        line = json.dumps(event, ensure_ascii=False)
+        assert "\n" not in line, case
+        assert json.loads(line)["preprocess"]["status"] == "invalid", case

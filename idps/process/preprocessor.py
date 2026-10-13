@@ -41,6 +41,27 @@ def _validate(event):
         if event.get(field) is None:
             reasons.append(f"missing required field: {field}")
 
+    # G.1 có bốn field bắt buộc; REQ-26.4 đòi `invalid` khi một trong chúng SAI
+    # KIỂU, không chỉ khi thiếu. `packet_id`/`timestamp` còn có khoảng giá trị ở
+    # G.4 nên kiểm cả khoảng; `schema_version`/`status` thì G.4 KHÔNG định nghĩa
+    # khoảng nào, nên chỉ kiểm kiểu — thêm một tập giá trị ở đây là tự đặt luật
+    # mà tài liệu không có (và sẽ chặn oan khi bài sau thêm một `status` mới).
+    schema_version = event.get("schema_version")
+    if schema_version is not None and (
+        isinstance(schema_version, bool) or not isinstance(schema_version, int)
+    ):
+        reasons.append(
+            f"invalid schema_version: {schema_version!r} "
+            f"(type {_type_name(schema_version)}, expected integer)"
+        )
+
+    status = event.get("status")
+    if status is not None and not isinstance(status, str):
+        reasons.append(
+            f"invalid status: {status!r} "
+            f"(type {_type_name(status)}, expected string)"
+        )
+
     packet_id = event.get("packet_id")
     if packet_id is not None and (
         isinstance(packet_id, bool) or not isinstance(packet_id, int) or packet_id < 1
